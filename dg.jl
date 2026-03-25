@@ -87,7 +87,7 @@ function rhs!(du, u, parameters, time)
     v1  = @view u[:, :, 4]
     v2  = @view u[:, :, 5]
 
-    # ===== Derivatives (no allocs)
+    # ===== Derivatives 
     mul!(c.s11r, Dr, s11); mul!(c.s11s, Ds, s11)
     @. c.s11x = rxJ * c.s11r + sxJ * c.s11s
     @. c.s11y = ryJ * c.s11r + syJ * c.s11s
@@ -176,7 +176,7 @@ function rhs!(du, u, parameters, time)
     mul!(c.tmp1, LIFT, c.liftbuf)
     @. du[:, :, 5] = (c.divsy + 0.5 * c.tmp1) / J
 
-    # ===== Constitutive (no alloc)
+    # ===== Constitutive Equations
     c.tmp1 .= @view du[:, :, 1]
     c.tmp2 .= @view du[:, :, 2]
 
