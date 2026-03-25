@@ -16,7 +16,7 @@ println("running simulation")
 gaussian(x, y, s) = exp(-(x^2 + y^2) / (2*s*s))
 
 N=2
-K1D = 8
+K1D = 32
 
 rd = RefElemData(Tri(), N)
 VXY, EToV = uniform_mesh(Tri(), K1D)
