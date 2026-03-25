@@ -7,6 +7,12 @@ using OrdinaryDiffEq
 using LinearAlgebra
 using OrdinaryDiffEq
 using Plots
+using Revise
+using Logging
+using TerminalLoggers
+
+global_logger(TerminalLogger())
+
 
 include("dg.jl")
 
@@ -32,14 +38,14 @@ xp, yp = vec(rd.Vp * x), vec(rd.Vp * y)
 
 scatter(xp, yp, zcolor=vec(rd.Vp*u[:,:,5]), markersize=2, markerstrokewidth=0, legend=false, clims=(-.25, .25))
 
+cache = RHSCache(u, rd)
 
-params = (; rd, md)
+params = (; rd, md, cache)
 du = similar(u)
-#rhs!(du, u, params, 0.0)
 tspan = (0.0, 1.0)
 ode = ODEProblem(rhs!, u, tspan, params)
 
-sol = solve(ode, RK4(), saveat=LinRange(tspan..., 50), progress=true)
+sol = solve(ode, RK4(), saveat=LinRange(tspan..., 50), progress=true, progress_steps = 1,)
 
 using Plots
 
@@ -51,28 +57,10 @@ frames = [vec(rd.Vp * ui[:, :, 5]) for ui in sol.u]
 xmin, xmax = extrema(xp)
 ymin, ymax = extrema(yp)
 
-# Auto scale (better than fixed -0.25, 0.25)
-cmax = maximum(abs, reduce(vcat, frames))
-clims = (-cmax, cmax)
+xp = vec(rd.Vp * x)
+yp = vec(rd.Vp * y)
 
-anim = @animate for i in eachindex(frames)
-    scatter(
-        xp, yp;
-        zcolor = frames[i],
-        markersize = 3,
-        markerstrokewidth = 0,
-        marker = :circle,
-        legend = false,
-        color = :balance,
-        clims = clims,
-        colorbar = true,
-        xlims = (xmin, xmax),
-        ylims = (ymin, ymax),
-        aspect_ratio = :equal,
-        xlabel = "x",
-        ylabel = "y",
-        title = "Wave field (u₅), step $i"
-    )
+@gif for i in eachindex(sol.u)    
+    scatter(xp, yp, zcolor=vec(rd.Vp * sol.u[i][:,:,1]), 
+    markersize=2, markerstrokewidth=0, legend=false)
 end
-
-gif(anim, "solution.gif", fps = 5)
