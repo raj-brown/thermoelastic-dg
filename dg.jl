@@ -1,7 +1,3 @@
-using StaticArrays
-
-
-using StaticArrays
 
 function rhs!(du, u, parameters, time)
 
@@ -72,13 +68,9 @@ function rhs!(du, u, parameters, time)
     divsy = s12x .+ s22y
     vxy   = v1y .+ v2x
 
-    # Compute the velocity fluxes
     nSx = nx .* ds11 .+ ny .* ds12
     nSy = nx .* ds12 .+ ny .* ds22
 
-    # Impose BC's here if needed
-
-    # Stress fluxes
     nv11x = dv1 .* nx
     nv11y = dv2 .* ny
     nvxy  = dv2 .* nx .+ dv1 .* ny
@@ -90,7 +82,6 @@ function rhs!(du, u, parameters, time)
     fcv1 = nSx
     fcv2 = nSy
 
-    # Penalization term
     fpenalty_s11 = fcv1 .* nxJ
     fpenalty_s22 = fcv2 .* nyJ
     fpenalty_s12 = fcv2 .* nxJ .+ fcv1 .* nyJ
@@ -105,13 +96,12 @@ function rhs!(du, u, parameters, time)
     fluxv1  = fcv1  .+ tau .* fpenalty_v1
     fluxv2  = fcv2  .+ tau .* fpenalty_v2
 
-    du[:, :, 1] .= (v1x .+ 0.5 .* (LIFT * (fluxS11 .* Jf))) ./ J
-    du[:, :, 2] .= (v1y .+ 0.5 .* (LIFT * (fluxS22 .* Jf))) ./ J
-    du[:, :, 3] .= (vxy .+ 0.5 .* (LIFT * (fluxS12 .* Jf))) ./ J
+    du[:, :, 1] .= (v1x  .+ 0.5 .* (LIFT * (fluxS11 .* Jf))) ./ J
+    du[:, :, 2] .= (v2y  .+ 0.5 .* (LIFT * (fluxS22 .* Jf))) ./ J
+    du[:, :, 3] .= (vxy  .+ 0.5 .* (LIFT * (fluxS12 .* Jf))) ./ J
     du[:, :, 4] .= (divsx .+ 0.5 .* (LIFT * (fluxv1  .* Jf))) ./ J
     du[:, :, 5] .= (divsy .+ 0.5 .* (LIFT * (fluxv2  .* Jf))) ./ J
 
-    # Fix overwrite bug by using temporaries
     tmp1 = copy(@view du[:, :, 1])
     tmp2 = copy(@view du[:, :, 2])
 
@@ -128,6 +118,7 @@ end
 function point_force(t)
     println("Adding point force at time $t")
 end
+
 
 function point_force(t)
     println("Adding point force at time $t")
