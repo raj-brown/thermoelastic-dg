@@ -1,3 +1,4 @@
 *.png
+*.vtu
 *.vtk
 results/

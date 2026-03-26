@@ -17,12 +17,10 @@ global_logger(TerminalLogger())
 include("dg.jl")
 
 println("running simulation")
-# Set up the problem
 
-#gaussian(x, y, s) = exp(-(x^2 + y^2) / (2 * s * s))
 
 N = 4
-K1D = 32
+K1D = 96
 
 rd = RefElemData(Quad(), N)
 VXY, EToV = uniform_mesh(Quad(), K1D)
@@ -50,7 +48,7 @@ cache = RHSCache(u, rd)
 
 params = (; rd, md, pt_src, cache)
 du = similar(u)
-tspan = (0.0, 1.0)
+tspan = (0.0, 0.5)
 ode = ODEProblem(rhs!, u, tspan, params)
 
 
@@ -64,6 +62,14 @@ frames = [vec(rd.Vp * ui[:, :, 5]) for ui in sol.u]
 xmin, xmax = extrema(xp)
 ymin, ymax = extrema(yp)
 
+xp = rd.Vp * x
+yp = rd.Vp * y
+u_out = rd.Vp * sol.u[end][:, :, 1]
+
+
+
+export_quad_subcells_vtu("test.vtu", xp, yp, u_out)
+
 xp = vec(rd.Vp * x)
 yp = vec(rd.Vp * y)
 
@@ -71,3 +77,5 @@ yp = vec(rd.Vp * y)
     scatter(xp, yp, zcolor=vec(rd.Vp * sol.u[i][:, :, 1]),
         markersize=2, markerstrokewidth=0, legend=false)
 end fps = 1
+
+## use VTK, MAKIE TriPlot

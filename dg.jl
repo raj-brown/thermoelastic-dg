@@ -1,3 +1,7 @@
+using WriteVTK
+
+
+
 struct RHSCache
     # volume arrays
     s11r
@@ -230,3 +234,50 @@ function rick(t, f0)
     return 1e1 * (1 .- 2 * (π * f0 * (t .- tR)) .^ 2) .* exp.(-(π * f0 * (t .- tR)) .^ 2)
 end
 
+
+
+function export_quad_subcells_vtu(filename, x, y, u)
+    @assert size(x) == size(y) == size(u)
+    Np, K = size(x)
+
+    q = round(Int, sqrt(Np))
+    @assert q * q == Np "Np must be a perfect square."
+    n1 = q
+
+    npts = Np * K
+    points = Matrix{Float64}(undef, 3, npts)
+    vals = Vector{Float64}(undef, npts)
+
+    for k in 1:K
+        off = (k - 1) * Np
+        for i in 1:Np
+            gid = off + i
+            points[1, gid] = x[i, k]
+            points[2, gid] = y[i, k]
+            points[3, gid] = 0.0
+            vals[gid] = u[i, k]
+        end
+    end
+
+    cells = MeshCell[]
+    for k in 1:K
+        off = (k - 1) * Np
+
+        # assume local ids are arranged on an n1 x n1 grid
+        local_ids = reshape(collect(1:Np), n1, n1)
+
+        for j in 1:n1-1, i in 1:n1-1
+            a = off + local_ids[i, j]
+            b = off + local_ids[i+1, j]
+            c = off + local_ids[i+1, j+1]
+            d = off + local_ids[i, j+1]
+
+            push!(cells, MeshCell(VTKCellTypes.VTK_TRIANGLE, [a, b, c]))
+            push!(cells, MeshCell(VTKCellTypes.VTK_TRIANGLE, [a, c, d]))
+        end
+    end
+
+    vtk_grid(filename, points, cells) do vtk
+        vtk["u", VTKPointData()] = vals
+    end
+end
