@@ -1,25 +1,47 @@
-using Pkg
-Pkg.activate(@__DIR__)
-Pkg.instantiate()
-
 using StartUpDG
 using OrdinaryDiffEq
+using OrdinaryDiffEqSSPRK
 using LinearAlgebra
-using OrdinaryDiffEq
 using Plots
 using Revise
-using Logging
-using TerminalLoggers
+using Dates
 
-global_logger(TerminalLogger())
+push!(LOAD_PATH, "src")
+using DG
 
+gr()
+ENV["GKSwstype"] = "100"
 
-include("dg.jl")
+# ============================================================
+# Output folder + autoclean old runs
+# ============================================================
+function make_output_dir(; root="output", keep_last=5)
+    mkpath(root)
 
-println("running simulation")
+    run_dir = joinpath(root, Dates.format(now(), "yyyy-mm-dd_HHMMSS"))
+    mkpath(run_dir)
 
+    runs = filter(name -> isdir(joinpath(root, name)), readdir(root))
+    sort!(runs)
 
-N = 4
+    old_runs = runs[1:max(0, length(runs) - keep_last)]
+
+    for r in old_runs
+        rm(joinpath(root, r); recursive=true, force=true)
+    end
+
+    return run_dir
+end
+
+outdir = make_output_dir(; root="output", keep_last=5)
+
+println("Running thermoelastic LDG solver")
+println("Writing outputs to: ", outdir)
+
+# ============================================================
+# Mesh
+# ============================================================
+N = 2
 K1D = 96
 
 rd = RefElemData(Quad(), N)
@@ -27,55 +49,150 @@ VXY, EToV = uniform_mesh(Quad(), K1D)
 md = MeshData(VXY, EToV, rd)
 md = make_periodic(md)
 
-
 (; x, y) = md
-u = zeros(rd.Np, md.K, 5)
-#u[:, :, 5] = gaussian.(x, y, 0.01)
 
+# ============================================================
+# State: [σxx, σyy, σxy, vx, vy, T, ψ]
+# ============================================================
+u = zeros(rd.Np, md.K, 7)
+
+T0 = 10.0
+u[:, :, 6] .= T0
+u[:, :, 7] .= 0.0
+
+gaussian(x, y, σ) = exp(-((x)^2 + (y)^2) / (2σ^2))
+u[:, :, 6] .+= 10.0 .* gaussian.(x, y, 0.08)
+
+# ============================================================
+# Source
+# ============================================================
 pt_src = zeros(rd.Np, md.K)
-x0 = 0.0
-y0 = 0.0
-ids = findall(abs.(x[:] .- x0) .+ abs.(y[:] .- y0) .< 1e-8)
-pt_src[ids] .= 1.0
 
+ids = findall(abs.(x[:]) .+ abs.(y[:]) .< 1e-8)
+pt_src[ids] .= 1.0
 pt_src = (rd.VDM * rd.VDM') * pt_src
 
-xp, yp = vec(rd.Vp * x), vec(rd.Vp * y)
-
-#scatter(xp, yp, zcolor=vec(rd.Vp * pt_src), markersize=2, markerstrokewidth=0, legend=false, clims=(-0.25, 0.25))
-
-cache = RHSCache(u, rd)
-
+# ============================================================
+# Cache + params
+# ============================================================
+cache = RHSCacheTE(u, rd)
 params = (; rd, md, pt_src, cache)
-du = similar(u)
-tspan = (0.0, 0.5)
-ode = ODEProblem(rhs!, u, tspan, params)
 
+# ============================================================
+# Material parameters
+# ============================================================
+ρ = 1.0
+μ = 1.0
+λ = 1.0
+τ = 1.0
 
-sol = solve(ode, RK4(), saveat=LinRange(tspan..., 10), progress=true, progress_steps=1, verbose=true)
+c11 = λ + 2μ
 
-xp = vec(rd.Vp * x)
-yp = vec(rd.Vp * y)
+dt, h, c_elastic = compute_dt(c11, ρ, τ, md)
+CFL = compute_cfl(c_elastic, dt, md, rd)
 
-frames = [vec(rd.Vp * ui[:, :, 5]) for ui in sol.u]
+tspan = (0.0, 1.0)
 
-xmin, xmax = extrema(xp)
-ymin, ymax = extrema(yp)
+# ============================================================
+# Solve
+# ============================================================
+prob = ODEProblem(rhs_thermoelastic_cldg!, u, tspan, params)
+cb = make_progress_callback(tspan, dt, CFL)
 
-xp = rd.Vp * x
-yp = rd.Vp * y
-u_out = rd.Vp * sol.u[end][:, :, 1]
+sol = solve(
+    prob,
+    SSPRK43(),
+    dt = dt,
+    adaptive = false,
+    saveat = LinRange(tspan[1], tspan[2], 40),
+    progress = true,
+    callback = cb
+)
 
+println("Solve complete")
 
+# ============================================================
+# Visualization
+# ============================================================
+println("Writing VTK snapshots...")
 
-export_quad_subcells_vtu("test.vtu", xp, yp, u_out)
+xplot = rd.Vp * x
+yplot = rd.Vp * y
 
-xp = vec(rd.Vp * x)
-yp = vec(rd.Vp * y)
+for (i, t) in enumerate(sol.t)
+    uplot = similar(sol.u[i], size(rd.Vp, 1), md.K, 7)
 
-@gif for i in eachindex(sol.u)
-    scatter(xp, yp, zcolor=vec(rd.Vp * sol.u[i][:, :, 1]),
-        markersize=2, markerstrokewidth=0, legend=false)
-end fps = 1
+    for fld in 1:7
+        uplot[:, :, fld] = rd.Vp * sol.u[i][:, :, fld]
+    end
 
-## use VTK, MAKIE TriPlot
+    filename = joinpath(outdir, "vtk_fields_$(lpad(i, 4, '0')).vtu")
+    export_quad_subcells_vtu(filename, xplot, yplot, uplot)
+end
+
+xp = vec(xplot)
+yp = vec(yplot)
+
+println("Writing animations...")
+
+# Velocity animation
+anim_v = @animate for i in eachindex(sol.u)
+    zi = vec(rd.Vp * sol.u[i][:, :, 5])
+
+    scatter(
+        xp, yp,
+        zcolor = zi,
+        markersize = 2,
+        markerstrokewidth = 0,
+        legend = false,
+        title = "v₂, t=$(round(sol.t[i], sigdigits=3))"
+    )
+end
+
+mp4(anim_v, joinpath(outdir, "v2.mp4"), fps=10)
+
+# Temperature animation
+anim_T = @animate for i in eachindex(sol.u)
+    zi = vec(rd.Vp * sol.u[i][:, :, 7])
+
+    scatter(
+        xp, yp,
+        zcolor = zi,
+        markersize = 2,
+        markerstrokewidth = 0,
+        legend = false,
+        clims = (T0 - 5, T0 + 5),
+        title = "T, t=$(round(sol.t[i], sigdigits=3))"
+    )
+end
+
+mp4(anim_T, joinpath(outdir, "T.mp4"), fps = 10)
+
+println("Animations saved")
+
+# ============================================================
+# Final field plot
+# ============================================================
+p = plot(layout = (2, 4), size = (1400, 700))
+
+field_names = ["σxx", "σyy", "σxy", "v₁", "v₂", "T", "ψ"]
+
+for i in 1:7
+    zi = vec(rd.Vp * sol.u[end][:, :, i])
+    scatter!(
+        p[i],
+        xp, yp,
+        zcolor = zi,
+        markersize = 1,
+        markerstrokewidth = 0,
+        legend = false,
+        title = field_names[i]
+    )
+end
+
+plot!(p[8], framestyle = :none)
+
+savefig(p, joinpath(outdir, "final.png"))
+
+println("Saved final.png")
+println("All outputs saved in: ", outdir)

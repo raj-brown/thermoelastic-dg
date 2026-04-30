@@ -1,4 +1,4 @@
 *.png
 *.vtu
 *.vtk
-results/
+output/
