@@ -655,7 +655,9 @@ function rhs_thermoelastic_cldg!(du, u, parameters, time)
          T0 * β * ((c.tmp1 + c.tmp2) + τ * c.divPi)) / cT -
         ψ / τ
 
-    @. du[:, :, 5] += pt_src * rick(time, 10.0)
+    @. du[:, :, 5] += pt_src * rick(time, 20.0)
+    @. du[:, :, 7] += pt_src * rick(time, 20.0)
+
 
     return nothing
 end
