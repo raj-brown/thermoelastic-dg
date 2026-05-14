@@ -141,10 +141,10 @@ function rhs_thermoelastic_ldg!(du, u, parameters, time)
     # ========================================================
     # O(1) nondimensional verification parameters
     # ========================================================
-    ρ = 1.0
+    ρ = 2.65
 
-    μ = 1.0
-    λ = 1.0
+    μ = 6.002
+    λ = 3.994
 
     c11 = λ + 2μ
     c22 = c11
@@ -153,11 +153,11 @@ function rhs_thermoelastic_ldg!(du, u, parameters, time)
 
     invrho = 1.0 / ρ
 
-    cT = 1.0
-    γ  = 1.0
-    T0 = 1.0
-    β  = 0.05
-    τ  = 1.0
+    cT = 11.7
+    γ  = 10.5
+    T0 = 0.3
+    β  = 79.2
+    τ  = 1.49e-05
 
     q_source = 0.0
 
