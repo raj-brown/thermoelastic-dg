@@ -2,3 +2,12 @@
 *.vtu
 *.vtk
 output/
+mms_output/
+
+# Julia
+*.jl.cov
+*.jl.mem
+/deps/deps.jl
+
+# OS / editor
+.DS_Store

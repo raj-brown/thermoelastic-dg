@@ -1,786 +1,1185 @@
 module DG
 
+# Thermoelastic model and experiment:
+#   J. M. Carcione et al., Geophysics 84 (2019), T1-T11,
+#   DOI 10.1190/geo2018-0448.1.
+#
+# Mechanical penalty flux:
+#   K. Shukla, J. Chan, M. V. de Hoop, and P. Jaiswal,
+#   Journal of Computational Physics 403 (2020), 109061,
+#   DOI 10.1016/j.jcp.2019.109061.
+#
+# The face corrections retain the precise Chan--Shukla structure
+#
+#   A_n(v_hat-v^-) = 1/2 A_n[[v]]
+#                    + alpha_sigma/2 A_n A_n'[[Sigma]],
+#
+#   t_hat-t^-       = 1/2 A_n'[[Sigma]]
+#                    + alpha_v/2 A_n' A_n[[v]],
+#
+# with [[u]]=u^+-u^- and total thermoelastic stress Sigma=s-b*theta.
+
 using LinearAlgebra
 using WriteVTK
-using ProgressMeter, Printf
 
-
+export ThermoelasticMaterial
+export CarcioneHeatSource
 export RHSCacheTE
-export rhs_thermoelastic_ldg!
-export rhs_thermoelastic_cldg!
-export rick
-export export_quad_subcells_vtu
-export make_progress_callback
+export make_material
+export carcione_reference_material
+export carcione_reference_properties
+export carcione_pulse
+export paper_heat_source
+export first_order_heat_supply
+export normalized_gaussian_source
+export rhs_thermoelastic_br1!
+export maximum_characteristic_speed
+export estimate_dt
 export compute_cfl
-export compute_dt
-using OrdinaryDiffEq
+export energy_components
+export energy_balance
+export interpolate_state
+export export_quad_subcells_vtu
+export NSTATE, STATE_FIELD_NAMES
+export ISXX, ISZZ, ISXZ, IVX, IVZ, ITHETA, IQX, IQZ
 
+# -----------------------------------------------------------------------------
+# State ordering
+# -----------------------------------------------------------------------------
+# The stored stresses are ELASTIC stresses s = C:epsilon.  The physical total
+# thermoelastic stress is Sigma = s - b*theta and is reconstructed whenever the
+# momentum equation, traction flux, or output routines need it.
+const ISXX   = 1
+const ISZZ   = 2
+const ISXZ   = 3
+const IVX    = 4
+const IVZ    = 5
+const ITHETA = 6
+const IQX    = 7
+const IQZ    = 8
+const NSTATE = 8
 
+const STATE_FIELD_NAMES = (
+    "s_xx", "s_zz", "s_xz", "v_x", "v_z", "theta", "q_x", "q_z"
+)
 
-# State:
-# u[:,:,1] = σxx
-# u[:,:,2] = σyy
-# u[:,:,3] = σxy
-# u[:,:,4] = vx
-# u[:,:,5] = vy
-# u[:,:,6] = T
-# u[:,:,7] = ψ
-
-struct RHSCacheTE
-    # elastic derivatives
-    s11r; s11s; s11x; s11y
-    s12r; s12s; s12x; s12y
-    s22r; s22s; s22x; s22y
-    v1r;  v1s;  v1x;  v1y
-    v2r;  v2s;  v2x;  v2y
-
-    # thermal LDG
-    Tr; Ts; Tx; Ty
-    qxr; qxs; qxx
-    qyr; qys; qyy
-    lapT
-
-    # Pi derivatives
-    Pix; Piy
-    Pir; Pis; Pix_x
-    Pjr; Pjs; Piy_y
-    divPi
-
-    # face elastic
-    s11m; s11p; ds11
-    s12m; s12p; ds12
-    s22m; s22p; ds22
-    v1m;  v1p;  dv1
-    v2m;  v2p;  dv2
-
-    # face thermal
-    Tm; Tp; dT
-    qxm; qxp; dqx
-    qym; qyp; dqy
-
-    # elastic flux/work
-    divsx; divsy; vxy
-    nSx; nSy
-    nv11x; nv11y; nvxy
-    fpenalty_s11; fpenalty_s22; fpenalty_s12
-    fpenalty_v1;  fpenalty_v2
-    fluxS11; fluxS22; fluxS12
-    fluxv1; fluxv2
-
-    # thermal flux/work
-    fluxT
-    fluxq
-
-    # buffers
-    liftbuf
-    tmp1
-    tmp2
-    tmp3
+# -----------------------------------------------------------------------------
+# Material data
+# -----------------------------------------------------------------------------
+struct ThermoelasticMaterial{T,MC<:AbstractMatrix{T},VB<:AbstractVector{T},MK<:AbstractMatrix{T}}
+    rho::T
+    C::MC
+    S::MC
+    b::VB
+    heat_capacity::T
+    Tref::T
+    K::MK
+    Kinv::MK
+    tau::T
+    alpha_v::T
+    alpha_sigma::T
+    eta_br1::T
 end
 
+"""
+    _normal_matrix(nx, nz)
 
-function RHSCacheTE(u, rd)
-    Np, K = size(u, 1), size(u, 2)
-    NfpK = size(rd.Vf, 1)
+Return the two-dimensional engineering-shear normal operator
 
-    vol  = zeros(Np, K)
-    face = zeros(NfpK, K)
+    A_n = [nx  0;
+           0  nz;
+           nz nx].
+"""
+function _normal_matrix(nx::T, nz::T) where {T}
+    return T[nx 0; 0 nz; nz nx]
+end
 
-    return RHSCacheTE(
-        # elastic derivatives
-        copy(vol), copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol), copy(vol),
+"""
+    _maximum_mechanical_speed(C, rho; nsamples=128)
 
-        # thermal LDG
-        copy(vol), copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol),
-        copy(vol),
+Sample the anisotropic acoustic tensor A_n' C A_n on the unit circle and
+return a conservative maximum elastic speed.
+"""
+function _maximum_mechanical_speed(C::AbstractMatrix, rho::Real; nsamples::Int=128)
+    cmax = 0.0
+    for j in 0:(nsamples - 1)
+        angle = 2pi * j / nsamples
+        nx = cos(angle)
+        nz = sin(angle)
+        An = _normal_matrix(nx, nz)
+        Qn = Symmetric(An' * C * An)
+        cmax = max(cmax, sqrt(maximum(eigvals(Qn)) / rho))
+    end
+    return cmax
+end
 
-        # Pi
-        copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol),
-        copy(vol), copy(vol), copy(vol),
-        copy(vol),
+"""
+    make_material(; rho, C, b, heat_capacity, Tref, K, tau,
+                    penalty_scale=1, br1_penalty_scale=0,
+                    alpha_v=nothing, alpha_sigma=nothing, eta_br1=nothing)
 
-        # face elastic
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
+Construct a homogeneous two-dimensional thermoelastic material.  `C` is the
+3-by-3 stiffness matrix in the engineering-shear Voigt ordering
+`[xx, zz, xz]`, `b` is the three-component thermal-stress vector, and `K` is
+the 2-by-2 conductivity tensor.
 
-        # face thermal
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
+The Chan--Shukla flux uses scalar penalties.  In dimensional variables their
+natural scales are a scalar impedance `rho*c_ref` and its reciprocal.  The
+`penalty_scale` multiplies both.  `br1_penalty_scale=0` selects pure BR1.
+"""
+function make_material(;
+    rho,
+    C,
+    b,
+    heat_capacity,
+    Tref,
+    K,
+    tau,
+    penalty_scale=1.0,
+    br1_penalty_scale=0.0,
+    alpha_v=nothing,
+    alpha_sigma=nothing,
+    eta_br1=nothing,
+)
+    T = promote_type(
+        Float64,
+        typeof(rho),
+        eltype(C),
+        eltype(b),
+        typeof(heat_capacity),
+        typeof(Tref),
+        eltype(K),
+        typeof(tau),
+    )
 
-        # elastic flux/work
-        copy(vol), copy(vol), copy(vol),
-        copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face),
-        copy(face), copy(face), copy(face),
-        copy(face), copy(face),
+    rhoT = convert(T, rho)
+    cT = convert(T, heat_capacity)
+    TrefT = convert(T, Tref)
+    tauT = convert(T, tau)
+    Cmat = Matrix{T}(C)
+    bvec = Vector{T}(b)
+    Kmat = Matrix{T}(K)
 
-        # thermal flux/work
-        copy(face), copy(face),
+    size(Cmat) == (3, 3) || throw(ArgumentError("C must be 3-by-3"))
+    length(bvec) == 3 || throw(ArgumentError("b must have length 3"))
+    size(Kmat) == (2, 2) || throw(ArgumentError("K must be 2-by-2"))
+    rhoT > 0 || throw(ArgumentError("rho must be positive"))
+    cT > 0 || throw(ArgumentError("heat_capacity must be positive"))
+    TrefT > 0 || throw(ArgumentError("Tref must be positive"))
+    tauT > 0 || throw(ArgumentError("tau must be positive"))
+    isposdef(Symmetric(Cmat)) || throw(ArgumentError("C must be symmetric positive definite"))
+    isposdef(Symmetric(Kmat)) || throw(ArgumentError("K must be symmetric positive definite"))
 
-        # buffers
-        copy(face), copy(vol), copy(vol), copy(vol)
+    Smat = inv(Cmat)
+    Kinv = inv(Kmat)
+
+    cref = _maximum_mechanical_speed(Cmat, rhoT)
+    Zref = rhoT * cref
+
+    alpha_vT = isnothing(alpha_v) ? convert(T, penalty_scale) * Zref : convert(T, alpha_v)
+    alpha_sigmaT = isnothing(alpha_sigma) ? convert(T, penalty_scale) / Zref : convert(T, alpha_sigma)
+
+    kmax = maximum(eigvals(Symmetric(Kmat)))
+    Zthermal = sqrt(cT * kmax / tauT)
+    etaT = isnothing(eta_br1) ? convert(T, br1_penalty_scale) * Zthermal : convert(T, eta_br1)
+
+    alpha_vT >= 0 || throw(ArgumentError("alpha_v must be nonnegative"))
+    alpha_sigmaT >= 0 || throw(ArgumentError("alpha_sigma must be nonnegative"))
+    etaT >= 0 || throw(ArgumentError("eta_br1 must be nonnegative"))
+
+    return ThermoelasticMaterial(
+        rhoT,
+        Cmat,
+        Smat,
+        bvec,
+        cT,
+        TrefT,
+        Kmat,
+        Kinv,
+        tauT,
+        alpha_vT,
+        alpha_sigmaT,
+        etaT,
     )
 end
 
+"""
+    carcione_reference_material(; penalty_scale=1, br1_penalty_scale=0)
 
-function rhs_thermoelastic_ldg!(du, u, parameters, time)
+Return the homogeneous isotropic material used for the coupled heat-source
+experiment in Figure 6 of Carcione et al. (2019).  The Lamé parameters are
+computed from the reported isothermal P-wave and S-wave speeds.  The reported
+thermal-stress coefficient beta = 7.92e4 Pa/K is used directly.
+"""
+function carcione_reference_material(;
+    penalty_scale::Real=1.0,
+    br1_penalty_scale::Real=0.0,
+)
+    rho = 2650.0
+    vI = 2457.0
+    vS = 1505.0
+    heat_capacity = 117.0
+    conductivity = 10.5
+    Tref = 300.0
+    beta = 7.92e4
 
-    # ========================================================
-    # O(1) nondimensional verification parameters
-    # ========================================================
-    ρ = 2.65
+    mu = rho * vS^2
+    lambda = rho * vI^2 - 2mu
+    tau = conductivity / (heat_capacity * vI^2)
 
-    μ = 6.002
-    λ = 3.994
+    C = [
+        lambda + 2mu  lambda          0.0
+        lambda        lambda + 2mu    0.0
+        0.0           0.0             mu
+    ]
+    b = [beta, beta, 0.0]
+    K = [conductivity 0.0; 0.0 conductivity]
 
-    c11 = λ + 2μ
-    c22 = c11
-    c12 = λ
-    c33 = μ
+    return make_material(
+        rho=rho,
+        C=C,
+        b=b,
+        heat_capacity=heat_capacity,
+        Tref=Tref,
+        K=K,
+        tau=tau,
+        penalty_scale=penalty_scale,
+        br1_penalty_scale=br1_penalty_scale,
+    )
+end
 
-    invrho = 1.0 / ρ
+"""
+    carcione_reference_properties(material)
 
-    cT = 11.7
-    γ  = 10.5
-    T0 = 0.3
-    β  = 79.2
-    τ  = 1.49e-05
+Return characteristic reference values for the isotropic Carcione material.
+For the supplied material these reproduce approximately
+`V_A = 3480 m/s`, `V_Einf = 3980 m/s`, and `V_Tinf = 1517 m/s`.
+"""
+function carcione_reference_properties(material::ThermoelasticMaterial)
+    rho = material.rho
+    C11 = material.C[1, 1]
+    C33 = material.C[3, 3]
+    beta = material.b[1]
+    c = material.heat_capacity
+    Tref = material.Tref
+    gamma = material.K[1, 1]
+    tau = material.tau
 
-    q_source = 0.0
+    vI = sqrt(C11 / rho)
+    vS = sqrt(C33 / rho)
+    coupling_speed_sq = beta^2 * Tref / (rho * c)
+    vA = sqrt(vI^2 + coupling_speed_sq)
+    Minf = gamma / (c * tau)
+    discriminant = max((vA^2 + Minf)^2 - 4Minf * vI^2, 0.0)
+    vEinf = sqrt(0.5 * (vA^2 + Minf + sqrt(discriminant)))
+    vTinf = sqrt(0.5 * (vA^2 + Minf - sqrt(discriminant)))
 
-    (; rd, md, pt_src, cache) = parameters
+    return (;
+        vI,
+        vS,
+        vA,
+        vEinf,
+        vTinf,
+        beta,
+        tau,
+        thermal_diffusivity=gamma / c,
+    )
+end
+
+# -----------------------------------------------------------------------------
+# Carcione heat-source pulse and spatial regularization
+# -----------------------------------------------------------------------------
+"""
+    carcione_pulse(t, f0, t0=3/(2*f0))
+
+The source history printed as equation (35) by Carcione et al.:
+
+    cos((t-t0)*f0) * exp(-2*(t-t0)^2*f0^2).
+
+No factor of `2*pi` is inserted because this routine follows the published
+formula literally.
+"""
+@inline function carcione_pulse(t, f0, t0=3 / (2 * f0))
+    xi = (t - t0) * f0
+    return cos(xi) * exp(-2 * xi^2)
+end
+
+struct CarcioneHeatSource{T,A<:AbstractMatrix{T},V<:AbstractVector{T}}
+    spatial::A
+    amplitude::T
+    f0::T
+    t0::T
+    tau::T
+    tmax::T
+    filter_dt::T
+    supply_history::V
+end
+
+"""
+    CarcioneHeatSource(spatial; amplitude=1, f0=3.5e6,
+                       t0=3/(2*f0), tau, tmax, filter_dt=nothing)
+
+Construct the centered heat source used for the Figure 6 configuration.
+`amplitude*carcione_pulse(t,f0,t0)` is Carcione's source `q(t)` in
+
+    K*Delta(theta) = c*(theta_t + tau*theta_tt)
+                     + Tref*b:E(v) + tau*Tref*b:E(v_t) + q.
+
+The energy-stable first-order Cattaneo formulation uses a heat-supply rate
+`r(t)` in
+
+    c*theta_t + Tref*b:E(v) + div(q_flux) = r.
+
+Exact elimination of the physical heat flux gives the source combination
+`r + tau*r_t`.  Therefore, to reproduce Carcione's second-order forcing,
+this constructor precomputes the causal scalar filter
+
+    tau*r_t + r = -q(t),    r(0)=0.
+
+The filter is integrated with RK4 on a uniform subgrid.  The default filter
+step resolves both the relaxation time and the published source pulse.
+"""
+function CarcioneHeatSource(
+    spatial::AbstractMatrix;
+    amplitude::Real=1.0,
+    f0::Real=3.5e6,
+    t0::Real=3 / (2 * f0),
+    tau::Real,
+    tmax::Real,
+    filter_dt=nothing,
+)
+    T = promote_type(
+        Float64,
+        eltype(spatial),
+        typeof(amplitude),
+        typeof(f0),
+        typeof(t0),
+        typeof(tau),
+        typeof(tmax),
+    )
+
+    amplitudeT = convert(T, amplitude)
+    f0T = convert(T, f0)
+    t0T = convert(T, t0)
+    tauT = convert(T, tau)
+    tmaxT = convert(T, tmax)
+
+    f0T > 0 || throw(ArgumentError("f0 must be positive"))
+    tauT > 0 || throw(ArgumentError("tau must be positive"))
+    tmaxT > 0 || throw(ArgumentError("tmax must be positive"))
+
+    requested_dt = if isnothing(filter_dt)
+        min(tauT / 20, inv(200 * f0T))
+    else
+        convert(T, filter_dt)
+    end
+    requested_dt > 0 || throw(ArgumentError("filter_dt must be positive"))
+
+    nsteps = max(1, ceil(Int, tmaxT / requested_dt))
+    dtT = tmaxT / nsteps
+    history = zeros(T, nsteps + 1)
+
+    qpaper(t) = amplitudeT * carcione_pulse(t, f0T, t0T)
+    source_rhs(t, r) = (-qpaper(t) - r) / tauT
+
+    @inbounds for n in 1:nsteps
+        tn = (n - 1) * dtT
+        rn = history[n]
+        k1 = source_rhs(tn, rn)
+        k2 = source_rhs(tn + dtT / 2, rn + dtT * k1 / 2)
+        k3 = source_rhs(tn + dtT / 2, rn + dtT * k2 / 2)
+        k4 = source_rhs(tn + dtT, rn + dtT * k3)
+        history[n + 1] = rn + (dtT / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    end
+
+    return CarcioneHeatSource(
+        Matrix{T}(spatial),
+        amplitudeT,
+        f0T,
+        t0T,
+        tauT,
+        tmaxT,
+        dtT,
+        history,
+    )
+end
+
+"""Return Carcione's published second-order heat-source history `q(t)`."""
+@inline paper_heat_source(source::CarcioneHeatSource, t) =
+    source.amplitude * carcione_pulse(t, source.f0, source.t0)
+
+"""
+    first_order_heat_supply(source, t)
+
+Return the linearly interpolated first-order supply `r(t)` satisfying
+`tau*r_t + r = -q(t)`.  The precomputed interval is `[0, source.tmax]`.
+"""
+@inline function first_order_heat_supply(source::CarcioneHeatSource, t)
+    t <= zero(t) && return source.supply_history[1]
+    t >= source.tmax && return source.supply_history[end]
+
+    coordinate = t / source.filter_dt
+    left = clamp(floor(Int, coordinate) + 1, 1, length(source.supply_history) - 1)
+    fraction = coordinate - (left - 1)
+    return muladd(
+        fraction,
+        source.supply_history[left + 1] - source.supply_history[left],
+        source.supply_history[left],
+    )
+end
+
+"""
+    normalized_gaussian_source(rd, md; x0=0, z0=0, sigma)
+
+Construct a smooth approximation to a two-dimensional point source and
+normalize its physical-domain integral to one using StartUpDG volume
+quadrature.  This avoids the four-copy ambiguity of placing a DG point source
+at a shared element vertex.
+"""
+function normalized_gaussian_source(rd, md; x0::Real=0.0, z0::Real=0.0, sigma::Real)
+    sigma > 0 || throw(ArgumentError("sigma must be positive"))
+    (; x, y, wJq) = md
+    (; Vq) = rd
+
+    source = @. exp(-((x - x0)^2 + (y - z0)^2) / (2sigma^2))
+    source_q = Vq * source
+    integral = sum(wJq .* source_q)
+
+    isfinite(integral) && integral > 0 ||
+        throw(ArgumentError("source normalization failed; integral = $integral"))
+
+    source ./= integral
+    return source
+end
+
+# -----------------------------------------------------------------------------
+# Cache
+# -----------------------------------------------------------------------------
+# Volume scratch slots
+const V_SIGXX       = 1
+const V_SIGZZ       = 2
+const V_SIGXZ       = 3
+const V_VX_XJ       = 4
+const V_VX_ZJ       = 5
+const V_VZ_XJ       = 6
+const V_VZ_ZJ       = 7
+const V_EPSXX       = 8
+const V_EPSZZ       = 9
+const V_GAMMAXZ     = 10
+const V_DR          = 11
+const V_DS          = 12
+const V_DXJ         = 13
+const V_DZJ         = 14
+const V_DIVSIGXJ    = 15
+const V_DIVSIGZJ    = 16
+const V_GRADTHETAX  = 17
+const V_GRADTHETAZ  = 18
+const V_DIVQ         = 19
+const V_LIFTVOL     = 20
+const NVOLUME_CACHE = 20
+
+# Face scratch slots
+const F_SIGXXM       = 1
+const F_SIGXXP       = 2
+const F_SIGZZM       = 3
+const F_SIGZZP       = 4
+const F_SIGXZM       = 5
+const F_SIGXZP       = 6
+const F_VXM          = 7
+const F_VXP          = 8
+const F_VZM          = 9
+const F_VZP          = 10
+const F_THETAM       = 11
+const F_THETAP       = 12
+const F_QXM          = 13
+const F_QXP          = 14
+const F_QZM          = 15
+const F_QZP          = 16
+const F_DSIGXX       = 17
+const F_DSIGZZ       = 18
+const F_DSIGXZ       = 19
+const F_DVX          = 20
+const F_DVZ          = 21
+const F_DTHETA       = 22
+const F_DQX          = 23
+const F_DQZ          = 24
+const F_DTX          = 25
+const F_DTZ          = 26
+const F_DVHATX       = 27
+const F_DVHATZ       = 28
+const F_STRESSCORRXX = 29
+const F_STRESSCORRZZ = 30
+const F_STRESSCORRXZ = 31
+const F_TRACTIONCORRX = 32
+const F_TRACTIONCORRZ = 33
+const F_QFLUXCORR    = 34
+const F_THETACORRX   = 35
+const F_THETACORRZ   = 36
+const F_LIFTBUF      = 37
+const NFACE_CACHE    = 37
+
+struct RHSCacheTE{T,AV<:Array{T,3},AF<:Array{T,3}}
+    volume::AV
+    face::AF
+end
+
+function RHSCacheTE(u::AbstractArray, rd)
+    T = eltype(u)
+    Np, K = size(u, 1), size(u, 2)
+    Nf = size(rd.Vf, 1)
+    volume = zeros(T, Np, K, NVOLUME_CACHE)
+    face = zeros(T, Nf, K, NFACE_CACHE)
+    return RHSCacheTE(volume, face)
+end
+
+@inline function _gather_plus!(up, um, mapP)
+    @inbounds for i in eachindex(up)
+        up[i] = um[mapP[i]]
+    end
+    return nothing
+end
+
+@inline function _derivative_numerators!(dxJ, dzJ, dr, ds, field, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+    mul!(dr, Dr, field)
+    mul!(ds, Ds, field)
+    @. dxJ = rxJ * dr + sxJ * ds
+    @. dzJ = ryJ * dr + syJ * ds
+    return nothing
+end
+
+# -----------------------------------------------------------------------------
+# Semi-discrete weak--strong DG operator
+# -----------------------------------------------------------------------------
+"""
+    rhs_thermoelastic_br1!(du, u, parameters, time)
+
+Eight-field two-dimensional thermoelastic DG operator:
+
+    u = [s_xx, s_zz, s_xz, v_x, v_z, theta, q_x, q_z].
+
+The elastic stress equation is the weak equation evaluated through its
+strong-equivalent SBP form.  Velocity is in strong form.  The mechanical
+numerical flux is the scalar Chan--Shukla penalty flux, with total stress
+`Sigma = s - b*theta`.  Temperature is weak and heat flux is strong, using
+BR1 traces.  `eta_br1 = 0` gives pure BR1.
+
+`parameters` must provide `rd`, `md`, `material`, `cache`, and `source`.
+The mesh is assumed periodic in this experiment, so every face has a valid
+neighbor in `mapP`.
+"""
+function rhs_thermoelastic_br1!(du, u, parameters, time)
+    (; rd, md, material, cache, source) = parameters
     (; Vf, Dr, Ds, LIFT) = rd
-    (; rxJ, sxJ, ryJ, syJ, nxJ, nyJ, nx, ny, J, Jf, mapP) = md
+    (; rxJ, sxJ, ryJ, syJ, nx, ny, J, Jf, mapP) = md
 
+    m = material
     c = cache
+    fill!(du, zero(eltype(du)))
 
-    hmin = minimum(sqrt.(J))
-    αT = 5.0 * (rd.N + 1)^2 / hmin
+    C11 = m.C[1, 1]
+    C12 = m.C[1, 2]
+    C13 = m.C[1, 3]
+    C22 = m.C[2, 2]
+    C23 = m.C[2, 3]
+    C33 = m.C[3, 3]
 
-    s11 = @view u[:, :, 1]
-    s22 = @view u[:, :, 2]
-    s12 = @view u[:, :, 3]
-    v1  = @view u[:, :, 4]
-    v2  = @view u[:, :, 5]
-    T   = @view u[:, :, 6]
-    ψ   = @view u[:, :, 7]
+    b1, b2, b3 = m.b
+    K11 = m.K[1, 1]
+    K12 = m.K[1, 2]
+    K21 = m.K[2, 1]
+    K22 = m.K[2, 2]
 
-    # ========================================================
-    # Elastic derivatives
-    # ========================================================
-    mul!(c.s11r, Dr, s11)
-    mul!(c.s11s, Ds, s11)
-    @. c.s11x = rxJ * c.s11r + sxJ * c.s11s
-    @. c.s11y = ryJ * c.s11r + syJ * c.s11s
+    @views begin
+        # State views
+        sxx = u[:, :, ISXX]
+        szz = u[:, :, ISZZ]
+        sxz = u[:, :, ISXZ]
+        vx = u[:, :, IVX]
+        vz = u[:, :, IVZ]
+        theta = u[:, :, ITHETA]
+        qx = u[:, :, IQX]
+        qz = u[:, :, IQZ]
 
-    mul!(c.s12r, Dr, s12)
-    mul!(c.s12s, Ds, s12)
-    @. c.s12x = rxJ * c.s12r + sxJ * c.s12s
-    @. c.s12y = ryJ * c.s12r + syJ * c.s12s
+        dsxx_dt = du[:, :, ISXX]
+        dszz_dt = du[:, :, ISZZ]
+        dsxz_dt = du[:, :, ISXZ]
+        dvx_dt = du[:, :, IVX]
+        dvz_dt = du[:, :, IVZ]
+        dtheta_dt = du[:, :, ITHETA]
+        dqx_dt = du[:, :, IQX]
+        dqz_dt = du[:, :, IQZ]
 
-    mul!(c.s22r, Dr, s22)
-    mul!(c.s22s, Ds, s22)
-    @. c.s22x = rxJ * c.s22r + sxJ * c.s22s
-    @. c.s22y = ryJ * c.s22r + syJ * c.s22s
+        # Volume cache views
+        sigxx = c.volume[:, :, V_SIGXX]
+        sigzz = c.volume[:, :, V_SIGZZ]
+        sigxz = c.volume[:, :, V_SIGXZ]
+        vx_xJ = c.volume[:, :, V_VX_XJ]
+        vx_zJ = c.volume[:, :, V_VX_ZJ]
+        vz_xJ = c.volume[:, :, V_VZ_XJ]
+        vz_zJ = c.volume[:, :, V_VZ_ZJ]
+        epsxx = c.volume[:, :, V_EPSXX]
+        epszz = c.volume[:, :, V_EPSZZ]
+        gammaxz = c.volume[:, :, V_GAMMAXZ]
+        dr = c.volume[:, :, V_DR]
+        ds = c.volume[:, :, V_DS]
+        dxJ = c.volume[:, :, V_DXJ]
+        dzJ = c.volume[:, :, V_DZJ]
+        divsigxJ = c.volume[:, :, V_DIVSIGXJ]
+        divsigzJ = c.volume[:, :, V_DIVSIGZJ]
+        gradtheta_x = c.volume[:, :, V_GRADTHETAX]
+        gradtheta_z = c.volume[:, :, V_GRADTHETAZ]
+        divq = c.volume[:, :, V_DIVQ]
+        liftvol = c.volume[:, :, V_LIFTVOL]
 
-    mul!(c.v1r, Dr, v1)
-    mul!(c.v1s, Ds, v1)
-    @. c.v1x = rxJ * c.v1r + sxJ * c.v1s
-    @. c.v1y = ryJ * c.v1r + syJ * c.v1s
+        # Face cache views
+        sigxxm = c.face[:, :, F_SIGXXM]
+        sigxxp = c.face[:, :, F_SIGXXP]
+        sigzzm = c.face[:, :, F_SIGZZM]
+        sigzzp = c.face[:, :, F_SIGZZP]
+        sigxzm = c.face[:, :, F_SIGXZM]
+        sigxzp = c.face[:, :, F_SIGXZP]
+        vxm = c.face[:, :, F_VXM]
+        vxp = c.face[:, :, F_VXP]
+        vzm = c.face[:, :, F_VZM]
+        vzp = c.face[:, :, F_VZP]
+        thetam = c.face[:, :, F_THETAM]
+        thetap = c.face[:, :, F_THETAP]
+        qxm = c.face[:, :, F_QXM]
+        qxp = c.face[:, :, F_QXP]
+        qzm = c.face[:, :, F_QZM]
+        qzp = c.face[:, :, F_QZP]
+        dsigxx = c.face[:, :, F_DSIGXX]
+        dsigzz = c.face[:, :, F_DSIGZZ]
+        dsigxz = c.face[:, :, F_DSIGXZ]
+        dvx = c.face[:, :, F_DVX]
+        dvz = c.face[:, :, F_DVZ]
+        dtheta = c.face[:, :, F_DTHETA]
+        dqx = c.face[:, :, F_DQX]
+        dqz = c.face[:, :, F_DQZ]
+        dtx = c.face[:, :, F_DTX]
+        dtz = c.face[:, :, F_DTZ]
+        dvhatx = c.face[:, :, F_DVHATX]
+        dvhatz = c.face[:, :, F_DVHATZ]
+        stresscorrxx = c.face[:, :, F_STRESSCORRXX]
+        stresscorrzz = c.face[:, :, F_STRESSCORRZZ]
+        stresscorrxz = c.face[:, :, F_STRESSCORRXZ]
+        tractioncorrx = c.face[:, :, F_TRACTIONCORRX]
+        tractioncorrz = c.face[:, :, F_TRACTIONCORRZ]
+        qfluxcorr = c.face[:, :, F_QFLUXCORR]
+        thetacorrx = c.face[:, :, F_THETACORRX]
+        thetacorrz = c.face[:, :, F_THETACORRZ]
+        liftbuf = c.face[:, :, F_LIFTBUF]
 
-    mul!(c.v2r, Dr, v2)
-    mul!(c.v2s, Ds, v2)
-    @. c.v2x = rxJ * c.v2r + sxJ * c.v2s
-    @. c.v2y = ryJ * c.v2r + syJ * c.v2s
+        # -----------------------------------------------------------------
+        # Total stress Sigma = s - b*theta
+        # -----------------------------------------------------------------
+        @. sigxx = sxx - b1 * theta
+        @. sigzz = szz - b2 * theta
+        @. sigxz = sxz - b3 * theta
 
-    # ========================================================
-    # Elastic face values
-    # ========================================================
-    mul!(c.s11m, Vf, s11)
-    mul!(c.s12m, Vf, s12)
-    mul!(c.s22m, Vf, s22)
-    mul!(c.v1m,  Vf, v1)
-    mul!(c.v2m,  Vf, v2)
+        # -----------------------------------------------------------------
+        # Face traces and plus states
+        # -----------------------------------------------------------------
+        mul!(sigxxm, Vf, sigxx)
+        mul!(sigzzm, Vf, sigzz)
+        mul!(sigxzm, Vf, sigxz)
+        mul!(vxm, Vf, vx)
+        mul!(vzm, Vf, vz)
+        mul!(thetam, Vf, theta)
+        mul!(qxm, Vf, qx)
+        mul!(qzm, Vf, qz)
 
-    @inbounds for i in eachindex(c.s11p)
-        p = mapP[i]
-        c.s11p[i] = c.s11m[p]
-        c.s12p[i] = c.s12m[p]
-        c.s22p[i] = c.s22m[p]
-        c.v1p[i]  = c.v1m[p]
-        c.v2p[i]  = c.v2m[p]
+        _gather_plus!(sigxxp, sigxxm, mapP)
+        _gather_plus!(sigzzp, sigzzm, mapP)
+        _gather_plus!(sigxzp, sigxzm, mapP)
+        _gather_plus!(vxp, vxm, mapP)
+        _gather_plus!(vzp, vzm, mapP)
+        _gather_plus!(thetap, thetam, mapP)
+        _gather_plus!(qxp, qxm, mapP)
+        _gather_plus!(qzp, qzm, mapP)
+
+        # Jump convention: plus minus minus, matching the theory.
+        @. dsigxx = sigxxp - sigxxm
+        @. dsigzz = sigzzp - sigzzm
+        @. dsigxz = sigxzp - sigxzm
+        @. dvx = vxp - vxm
+        @. dvz = vzp - vzm
+        @. dtheta = thetap - thetam
+        @. dqx = qxp - qxm
+        @. dqz = qzp - qzm
+
+        # A_n' jump(Sigma): total-traction jump using the local outward normal.
+        @. dtx = nx * dsigxx + ny * dsigxz
+        @. dtz = nx * dsigxz + ny * dsigzz
+
+        # Chan--Shukla v-hat correction:
+        # vhat - vminus = 1/2 jump(v) + alpha_sigma/2 A_n' jump(Sigma).
+        @. dvhatx = 0.5 * dvx + 0.5 * m.alpha_sigma * dtx
+        @. dvhatz = 0.5 * dvz + 0.5 * m.alpha_sigma * dtz
+
+        # -----------------------------------------------------------------
+        # Weak elastic-stress equation, evaluated in strong-equivalent form
+        # S s_t = E(v) + LIFT(A_n(vhat-vminus)).
+        # -----------------------------------------------------------------
+        _derivative_numerators!(vx_xJ, vx_zJ, dr, ds, vx, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        _derivative_numerators!(vz_xJ, vz_zJ, dr, ds, vz, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+
+        @. stresscorrxx = nx * dvhatx
+        @. stresscorrzz = ny * dvhatz
+        @. stresscorrxz = ny * dvhatx + nx * dvhatz
+
+        @. liftbuf = stresscorrxx * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. epsxx = (vx_xJ + liftvol) / J
+
+        @. liftbuf = stresscorrzz * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. epszz = (vz_zJ + liftvol) / J
+
+        @. liftbuf = stresscorrxz * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. gammaxz = (vx_zJ + vz_xJ + liftvol) / J
+
+        @. dsxx_dt = C11 * epsxx + C12 * epszz + C13 * gammaxz
+        @. dszz_dt = C12 * epsxx + C22 * epszz + C23 * gammaxz
+        @. dsxz_dt = C13 * epsxx + C23 * epszz + C33 * gammaxz
+
+        # -----------------------------------------------------------------
+        # Strong velocity equation
+        # rho v_t = D(Sigma) + LIFT(that - tminus).
+        # -----------------------------------------------------------------
+        _derivative_numerators!(dxJ, dzJ, dr, ds, sigxx, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        divsigxJ .= dxJ
+
+        _derivative_numerators!(dxJ, dzJ, dr, ds, sigxz, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        @. divsigxJ += dzJ
+        divsigzJ .= dxJ
+
+        _derivative_numerators!(dxJ, dzJ, dr, ds, sigzz, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        @. divsigzJ += dzJ
+
+        # A_n' A_n jump(v), written without forming A_n.
+        @. tractioncorrx =
+            0.5 * dtx +
+            0.5 * m.alpha_v * (
+                nx * (nx * dvx) +
+                ny * (ny * dvx + nx * dvz)
+            )
+
+        @. tractioncorrz =
+            0.5 * dtz +
+            0.5 * m.alpha_v * (
+                ny * (ny * dvz) +
+                nx * (ny * dvx + nx * dvz)
+            )
+
+        @. liftbuf = tractioncorrx * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. dvx_dt = (divsigxJ + liftvol) / (m.rho * J)
+
+        @. liftbuf = tractioncorrz * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. dvz_dt = (divsigzJ + liftvol) / (m.rho * J)
+
+        # -----------------------------------------------------------------
+        # Weak temperature equation
+        # c theta_t = r - Tref*b'E_h(v) - div_h(q).
+        # Using the same epsxx/epszz/gammaxz arrays enforces the exact
+        # semi-discrete thermoelastic cancellation proved in the manuscript.
+        # -----------------------------------------------------------------
+        _derivative_numerators!(dxJ, dzJ, dr, ds, qx, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        divq .= dxJ
+        _derivative_numerators!(dxJ, dzJ, dr, ds, qz, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+        @. divq += dzJ
+
+        # qhat_n - qminus_n = 1/2 jump(q).n - eta_br1 jump(theta).
+        @. qfluxcorr = 0.5 * (nx * dqx + ny * dqz) - m.eta_br1 * dtheta
+        @. liftbuf = qfluxcorr * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. divq = (divq + liftvol) / J
+
+        source_supply = first_order_heat_supply(source, time)
+        @. dtheta_dt = (
+            source_supply * source.spatial -
+            m.Tref * (b1 * epsxx + b2 * epszz + b3 * gammaxz) -
+            divq
+        ) / m.heat_capacity
+
+        # -----------------------------------------------------------------
+        # Strong Cattaneo heat-flux equation with the BR1 theta trace
+        # tau q_t + q + K grad_h(theta) = 0.
+        # -----------------------------------------------------------------
+        _derivative_numerators!(dxJ, dzJ, dr, ds, theta, Dr, Ds, rxJ, sxJ, ryJ, syJ)
+
+        @. thetacorrx = 0.5 * dtheta * nx
+        @. liftbuf = thetacorrx * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. gradtheta_x = (dxJ + liftvol) / J
+
+        @. thetacorrz = 0.5 * dtheta * ny
+        @. liftbuf = thetacorrz * Jf
+        mul!(liftvol, LIFT, liftbuf)
+        @. gradtheta_z = (dzJ + liftvol) / J
+
+        @. dqx_dt = -(qx + K11 * gradtheta_x + K12 * gradtheta_z) / m.tau
+        @. dqz_dt = -(qz + K21 * gradtheta_x + K22 * gradtheta_z) / m.tau
     end
-
-    @. c.ds11 = c.s11p - c.s11m
-    @. c.ds12 = c.s12p - c.s12m
-    @. c.ds22 = c.s22p - c.s22m
-    @. c.dv1  = c.v1p  - c.v1m
-    @. c.dv2  = c.v2p  - c.v2m
-
-    # ========================================================
-    # Elastic numerical fluxes
-    # ========================================================
-    @. c.nSx = nx * c.ds11 + ny * c.ds12
-    @. c.nSy = nx * c.ds12 + ny * c.ds22
-
-    @. c.nv11x = c.dv1 * nx
-    @. c.nv11y = c.dv2 * ny
-    @. c.nvxy  = c.dv2 * nx + c.dv1 * ny
-
-    @. c.fpenalty_s11 = c.nSx * nxJ
-    @. c.fpenalty_s22 = c.nSy * nyJ
-    @. c.fpenalty_s12 = c.nSy * nxJ + c.nSx * nyJ
-
-    @. c.fpenalty_v1 = nxJ * c.nv11x + nyJ * c.nvxy
-    @. c.fpenalty_v2 = nxJ * c.nvxy  + nyJ * c.nv11y
-
-    @. c.fluxS11 = c.nv11x + c.fpenalty_s11
-    @. c.fluxS22 = c.nv11y + c.fpenalty_s22
-    @. c.fluxS12 = c.nvxy  + c.fpenalty_s12
-
-    @. c.fluxv1 = c.nSx + c.fpenalty_v1
-    @. c.fluxv2 = c.nSy + c.fpenalty_v2
-
-    # ========================================================
-    # Elastic RHS before constitutive law
-    # ========================================================
-    @. c.liftbuf = c.fluxS11 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 1] = (c.v1x + 0.5 * c.tmp1) / J
-
-    @. c.liftbuf = c.fluxS22 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 2] = (c.v2y + 0.5 * c.tmp1) / J
-
-    @. c.vxy = c.v1y + c.v2x
-    @. c.liftbuf = c.fluxS12 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 3] = (c.vxy + 0.5 * c.tmp1) / J
-
-    @. c.divsx = c.s11x + c.s12y
-    @. c.divsy = c.s12x + c.s22y
-
-    @. c.liftbuf = c.fluxv1 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 4] = invrho * (c.divsx + 0.5 * c.tmp1) / J
-
-    @. c.liftbuf = c.fluxv2 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 5] = invrho * (c.divsy + 0.5 * c.tmp1) / J
-
-    # ========================================================
-    # Π = acceleration and div(Π)
-    # ========================================================
-    c.Pix .= @view du[:, :, 4]
-    c.Piy .= @view du[:, :, 5]
-
-    mul!(c.Pir, Dr, c.Pix)
-    mul!(c.Pis, Ds, c.Pix)
-    @. c.Pix_x = rxJ * c.Pir + sxJ * c.Pis
-
-    mul!(c.Pjr, Dr, c.Piy)
-    mul!(c.Pjs, Ds, c.Piy)
-    @. c.Piy_y = ryJ * c.Pjr + syJ * c.Pjs
-
-    @. c.divPi = c.Pix_x + c.Piy_y
-
-    # ========================================================
-    # LDG thermal Laplacian
-    #
-    # q = ∇T
-    # ΔT = ∇·q
-    #
-    # Flux choice:
-    # T_hat = T_plus
-    # q_hat·n = q_minus·n - αT [T]
-    # ========================================================
-
-    # ---------------------------
-    # Stage 1: q = ∇T
-    # ---------------------------
-    mul!(c.Tr, Dr, T)
-    mul!(c.Ts, Ds, T)
-
-    @. c.Tx = rxJ * c.Tr + sxJ * c.Ts
-    @. c.Ty = ryJ * c.Tr + syJ * c.Ts
-
-    mul!(c.Tm, Vf, T)
-
-    @inbounds for i in eachindex(c.Tp)
-        p = mapP[i]
-        c.Tp[i] = c.Tm[p]
-    end
-
-    @. c.dT = c.Tp - c.Tm
-
-    # Strong-form correction for T_hat = T_plus.
-    @. c.liftbuf = c.dT * nxJ * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. c.Tx -= c.tmp1 / J
-
-    @. c.liftbuf = c.dT * nyJ * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. c.Ty += c.tmp1 / J
-
-    # ---------------------------
-    # Stage 2: ΔT = ∇·q
-    # ---------------------------
-    mul!(c.qxr, Dr, c.Tx)
-    mul!(c.qxs, Ds, c.Tx)
-    @. c.qxx = rxJ * c.qxr + sxJ * c.qxs
-
-    mul!(c.qyr, Dr, c.Ty)
-    mul!(c.qys, Ds, c.Ty)
-    @. c.qyy = ryJ * c.qyr + syJ * c.qys
-
-    mul!(c.qxm, Vf, c.Tx)
-    mul!(c.qym, Vf, c.Ty)
-
-    @inbounds for i in eachindex(c.qxp)
-        p = mapP[i]
-        c.qxp[i] = c.qxm[p]
-        c.qyp[i] = c.qym[p]
-    end
-
-    @. c.dqx = c.qxp - c.qxm
-    @. c.dqy = c.qyp - c.qym
-
-    # q_hat = q_minus - αT [T] n
-    # Therefore (q_hat - q_minus)·n = -αT [T].
-    @. c.fluxq = -αT * c.dT
-
-    @. c.liftbuf = c.fluxq * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-
-    # Strong-form correction.
-    @. c.lapT = c.qxx + c.qyy - c.tmp1 / J
-
-    # ========================================================
-    # Final thermoelastic RHS
-    # ========================================================
-    c.tmp1 .= @view du[:, :, 1]   # e_xx_dot
-    c.tmp2 .= @view du[:, :, 2]   # e_yy_dot
-    c.tmp3 .= @view du[:, :, 3]   # 2e_xy_dot
-
-    @. du[:, :, 1] = c11 * c.tmp1 + c12 * c.tmp2 - β * ψ
-    @. du[:, :, 2] = c12 * c.tmp1 + c22 * c.tmp2 - β * ψ
-    @. du[:, :, 3] = c33 * c.tmp3
-
-    # Velocity equations are already assigned in du[:,:,4:5].
-
-    # Temperature equation
-    @. du[:, :, 6] = ψ
-
-    # Relaxation equation.
-    # Safer verification version: no τ divΠ term.
-    # @. du[:, :, 7] =
-    #     (γ * c.lapT -
-    #      q_source -
-    #      T0 * β * (c.tmp1 + c.tmp2)) / cT -
-    #     ψ / τ
-
-    # Full PDE version, enable after basic stability check:
-    @. du[:, :, 7] =
-        (γ * c.lapT -
-         q_source -
-         T0 * β * ((c.tmp1 + c.tmp2) + τ * c.divPi)) / cT -
-        ψ / τ
-
-    @. du[:, :, 5] += pt_src * rick(time, 10.0)
 
     return nothing
 end
 
+# -----------------------------------------------------------------------------
+# Characteristic speed and time-step estimate
+# -----------------------------------------------------------------------------
+function _principal_symbol(material::ThermoelasticMaterial, nx::Real, nz::Real)
+    T = eltype(material.C)
+    An = _normal_matrix(convert(T, nx), convert(T, nz))
+    B = zeros(T, NSTATE, NSTATE)
 
+    # Ordering [s(3), v(2), theta, q(2)].
+    B[1:3, 4:5] .= material.C * An
+    B[4:5, 1:3] .= An' / material.rho
+    B[4:5, 6] .= -(An' * material.b) / material.rho
+    B[6, 4:5] .= -(material.Tref / material.heat_capacity) .* vec(material.b' * An)
+    B[6, 7] = -nx / material.heat_capacity
+    B[6, 8] = -nz / material.heat_capacity
+    B[7:8, 6] .= -(material.K * T[nx, nz]) / material.tau
 
-function rhs_thermoelastic_cldg!(du, u, parameters, time)
+    return B
+end
 
-    # ========================================================
-    # O(1) nondimensional verification parameters
-    # ========================================================
-    ρ = 1.0
+"""
+    maximum_characteristic_speed(material; nsamples=128)
 
-    μ = 1.0
-    λ = 1.0
+Compute the largest absolute eigenvalue of the complete coupled principal
+symbol, sampled over propagation directions.  For the isotropic Carcione
+material this returns approximately 3980 m/s.
+"""
+function maximum_characteristic_speed(material::ThermoelasticMaterial; nsamples::Int=128)
+    nsamples >= 4 || throw(ArgumentError("nsamples must be at least 4"))
+    cmax = 0.0
+    max_imaginary = 0.0
 
-    c11 = λ + 2μ
-    c22 = c11
-    c12 = λ
-    c33 = μ
-
-    invrho = 1.0 / ρ
-
-    cT = 1.0
-    γ  = 1.0
-    T0 = 1.0
-    β  = 0.05
-    τ  = 1.0
-
-    q_source = 0.0
-
-    (; rd, md, pt_src, cache) = parameters
-    (; Vf, Dr, Ds, LIFT) = rd
-    (; rxJ, sxJ, ryJ, syJ, nxJ, nyJ, nx, ny, J, Jf, mapP) = md
-
-    c = cache
-
-    hmin = minimum(sqrt.(J))
-    η = 10.0 * (rd.N + 1)^2 / hmin
-
-    s11 = @view u[:, :, 1]
-    s22 = @view u[:, :, 2]
-    s12 = @view u[:, :, 3]
-    v1  = @view u[:, :, 4]
-    v2  = @view u[:, :, 5]
-    T   = @view u[:, :, 6]
-    ψ   = @view u[:, :, 7]
-
-    # ========================================================
-    # Elastic derivatives
-    # ========================================================
-    mul!(c.s11r, Dr, s11)
-    mul!(c.s11s, Ds, s11)
-    @. c.s11x = rxJ * c.s11r + sxJ * c.s11s
-    @. c.s11y = ryJ * c.s11r + syJ * c.s11s
-
-    mul!(c.s12r, Dr, s12)
-    mul!(c.s12s, Ds, s12)
-    @. c.s12x = rxJ * c.s12r + sxJ * c.s12s
-    @. c.s12y = ryJ * c.s12r + syJ * c.s12s
-
-    mul!(c.s22r, Dr, s22)
-    mul!(c.s22s, Ds, s22)
-    @. c.s22x = rxJ * c.s22r + sxJ * c.s22s
-    @. c.s22y = ryJ * c.s22r + syJ * c.s22s
-
-    mul!(c.v1r, Dr, v1)
-    mul!(c.v1s, Ds, v1)
-    @. c.v1x = rxJ * c.v1r + sxJ * c.v1s
-    @. c.v1y = ryJ * c.v1r + syJ * c.v1s
-
-    mul!(c.v2r, Dr, v2)
-    mul!(c.v2s, Ds, v2)
-    @. c.v2x = rxJ * c.v2r + sxJ * c.v2s
-    @. c.v2y = ryJ * c.v2r + syJ * c.v2s
-
-    # ========================================================
-    # Elastic face values
-    # ========================================================
-    mul!(c.s11m, Vf, s11)
-    mul!(c.s12m, Vf, s12)
-    mul!(c.s22m, Vf, s22)
-    mul!(c.v1m,  Vf, v1)
-    mul!(c.v2m,  Vf, v2)
-
-    @inbounds for i in eachindex(c.s11p)
-        p = mapP[i]
-        c.s11p[i] = c.s11m[p]
-        c.s12p[i] = c.s12m[p]
-        c.s22p[i] = c.s22m[p]
-        c.v1p[i]  = c.v1m[p]
-        c.v2p[i]  = c.v2m[p]
+    for j in 0:(nsamples - 1)
+        angle = 2pi * j / nsamples
+        B = _principal_symbol(material, cos(angle), sin(angle))
+        values = eigvals(B)
+        cmax = max(cmax, maximum(abs.(values)))
+        max_imaginary = max(max_imaginary, maximum(abs, imag.(values)))
     end
 
-    @. c.ds11 = c.s11p - c.s11m
-    @. c.ds12 = c.s12p - c.s12m
-    @. c.ds22 = c.s22p - c.s22m
-    @. c.dv1  = c.v1p  - c.v1m
-    @. c.dv2  = c.v2p  - c.v2m
-
-    # ========================================================
-    # Elastic numerical fluxes
-    # ========================================================
-    @. c.nSx = nx * c.ds11 + ny * c.ds12
-    @. c.nSy = nx * c.ds12 + ny * c.ds22
-
-    @. c.nv11x = c.dv1 * nx
-    @. c.nv11y = c.dv2 * ny
-    @. c.nvxy  = c.dv2 * nx + c.dv1 * ny
-
-    @. c.fpenalty_s11 = c.nSx * nxJ
-    @. c.fpenalty_s22 = c.nSy * nyJ
-    @. c.fpenalty_s12 = c.nSy * nxJ + c.nSx * nyJ
-
-    @. c.fpenalty_v1 = nxJ * c.nv11x + nyJ * c.nvxy
-    @. c.fpenalty_v2 = nxJ * c.nvxy  + nyJ * c.nv11y
-
-    @. c.fluxS11 = c.nv11x + c.fpenalty_s11
-    @. c.fluxS22 = c.nv11y + c.fpenalty_s22
-    @. c.fluxS12 = c.nvxy  + c.fpenalty_s12
-
-    @. c.fluxv1 = c.nSx + c.fpenalty_v1
-    @. c.fluxv2 = c.nSy + c.fpenalty_v2
-
-    # ========================================================
-    # Elastic RHS before constitutive law
-    # ========================================================
-    @. c.liftbuf = c.fluxS11 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 1] = (c.v1x + 0.5 * c.tmp1) / J
-
-    @. c.liftbuf = c.fluxS22 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 2] = (c.v2y + 0.5 * c.tmp1) / J
-
-    @. c.vxy = c.v1y + c.v2x
-    @. c.liftbuf = c.fluxS12 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 3] = (c.vxy + 0.5 * c.tmp1) / J
-
-    @. c.divsx = c.s11x + c.s12y
-    @. c.divsy = c.s12x + c.s22y
-
-    @. c.liftbuf = c.fluxv1 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 4] = invrho * (c.divsx + 0.5 * c.tmp1) / J
-
-    @. c.liftbuf = c.fluxv2 * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
-    @. du[:, :, 5] = invrho * (c.divsy + 0.5 * c.tmp1) / J
-
-    # ========================================================
-    # Π = acceleration and div(Π)
-    # ========================================================
-    c.Pix .= @view du[:, :, 4]
-    c.Piy .= @view du[:, :, 5]
-
-    mul!(c.Pir, Dr, c.Pix)
-    mul!(c.Pis, Ds, c.Pix)
-    @. c.Pix_x = rxJ * c.Pir + sxJ * c.Pis
-
-    mul!(c.Pjr, Dr, c.Piy)
-    mul!(c.Pjs, Ds, c.Piy)
-    @. c.Piy_y = ryJ * c.Pjr + syJ * c.Pjs
-
-    @. c.divPi = c.Pix_x + c.Piy_y
-
-    # ========================================================
-    # CLDG / SIPG thermal Laplacian
-    #
-    # Δ_h T = div(grad T) with compact numerical flux:
-    #
-    # q_hat · n = {grad T} · n - η [T]
-    #
-    # This is more robust than alternating LDG.
-    # ========================================================
-
-    # Volume gradient of T
-    mul!(c.Tr, Dr, T)
-    mul!(c.Ts, Ds, T)
-
-    @. c.Tx = rxJ * c.Tr + sxJ * c.Ts
-    @. c.Ty = ryJ * c.Tr + syJ * c.Ts
-
-    # Volume divergence of grad T
-    mul!(c.qxr, Dr, c.Tx)
-    mul!(c.qxs, Ds, c.Tx)
-    @. c.qxx = rxJ * c.qxr + sxJ * c.qxs
-
-    mul!(c.qyr, Dr, c.Ty)
-    mul!(c.qys, Ds, c.Ty)
-    @. c.qyy = ryJ * c.qyr + syJ * c.qys
-
-    # Face temperature
-    mul!(c.Tm, Vf, T)
-
-    @inbounds for i in eachindex(c.Tp)
-        p = mapP[i]
-        c.Tp[i] = c.Tm[p]
+    if max_imaginary > 1e-8 * max(1.0, cmax)
+        @warn "The sampled principal symbol has non-negligible complex eigenvalues" max_imaginary
     end
 
-    @. c.dT = c.Tp - c.Tm
+    return cmax
+end
 
-    # Face gradients
-    mul!(c.qxm, Vf, c.Tx)
-    mul!(c.qym, Vf, c.Ty)
+"""
+    estimate_dt(material, rd, md; CFL=0.25, relaxation_fraction=0.5)
 
-    @inbounds for i in eachindex(c.qxp)
-        p = mapP[i]
-        c.qxp[i] = c.qxm[p]
-        c.qyp[i] = c.qym[p]
+Return a conservative explicit time step for the square affine mesh used in
+the Carcione experiment.  The wave restriction uses `(N+1)^2`, while the
+local Cattaneo relaxation restriction is a fraction of `tau`.
+"""
+function estimate_dt(
+    material::ThermoelasticMaterial,
+    rd,
+    md;
+    CFL::Real=0.25,
+    relaxation_fraction::Real=0.5,
+    speed_samples::Int=128,
+)
+    CFL > 0 || throw(ArgumentError("CFL must be positive"))
+    relaxation_fraction > 0 || throw(ArgumentError("relaxation_fraction must be positive"))
+
+    # For the affine square cells in main.jl, J = (h/2)^2.
+    h = 2 * minimum(sqrt.(abs.(md.J)))
+    cmax = maximum_characteristic_speed(material; nsamples=speed_samples)
+    degree_factor = (rd.N + 1)^2
+
+    dt_wave = CFL * h / (degree_factor * cmax)
+    dt_relax = relaxation_fraction * material.tau
+    dt = min(dt_wave, dt_relax)
+
+    info = (;
+        h,
+        cmax,
+        degree_factor,
+        dt_wave,
+        dt_relax,
+        limiting=(dt_wave <= dt_relax ? :wave : :relaxation),
+    )
+    return dt, info
+end
+
+function compute_cfl(dt::Real, material::ThermoelasticMaterial, rd, md)
+    h = 2 * minimum(sqrt.(abs.(md.J)))
+    cmax = maximum_characteristic_speed(material)
+    return (rd.N + 1)^2 * cmax * dt / h
+end
+
+# -----------------------------------------------------------------------------
+# Diagnostics and output
+# -----------------------------------------------------------------------------
+"""
+    energy_components(u, rd, md, material)
+
+Evaluate the semi-discrete energy components with StartUpDG volume
+quadrature.  The result includes the Cattaneo relaxation dissipation rate.
+"""
+function energy_components(u, rd, md, material::ThermoelasticMaterial)
+    (; Vq) = rd
+    (; wJq) = md
+
+    @views begin
+        sxxq = Vq * u[:, :, ISXX]
+        szzq = Vq * u[:, :, ISZZ]
+        sxzq = Vq * u[:, :, ISXZ]
+        vxq = Vq * u[:, :, IVX]
+        vzq = Vq * u[:, :, IVZ]
+        thetaq = Vq * u[:, :, ITHETA]
+        qxq = Vq * u[:, :, IQX]
+        qzq = Vq * u[:, :, IQZ]
     end
 
-    # Average normal derivative
-    @. c.fluxT =
-        0.5 * (
-            nx * (c.qxm + c.qxp) +
-            ny * (c.qym + c.qyp)
-        ) -
-        η * c.dT
+    S = material.S
+    epsxxq = @. S[1, 1] * sxxq + S[1, 2] * szzq + S[1, 3] * sxzq
+    epszzq = @. S[2, 1] * sxxq + S[2, 2] * szzq + S[2, 3] * sxzq
+    gammaxzq = @. S[3, 1] * sxxq + S[3, 2] * szzq + S[3, 3] * sxzq
 
-    # Strong-form surface correction
-    @. c.liftbuf = c.fluxT * Jf
-    mul!(c.tmp1, LIFT, c.liftbuf)
+    Kinv = material.Kinv
+    Kiqx = @. Kinv[1, 1] * qxq + Kinv[1, 2] * qzq
+    Kiqz = @. Kinv[2, 1] * qxq + Kinv[2, 2] * qzq
 
-    @. c.lapT = c.qxx + c.qyy - c.tmp1 / J
+    elastic_density = @. 0.5 * (sxxq * epsxxq + szzq * epszzq + sxzq * gammaxzq)
+    kinetic_density = @. 0.5 * material.rho * (vxq^2 + vzq^2)
+    temperature_density = @. 0.5 * material.heat_capacity / material.Tref * thetaq^2
+    heat_flux_density = @. 0.5 * material.tau / material.Tref * (qxq * Kiqx + qzq * Kiqz)
+    relaxation_density = @. (qxq * Kiqx + qzq * Kiqz) / material.Tref
 
-    # ========================================================
-    # Final thermoelastic RHS
-    # ========================================================
-    c.tmp1 .= @view du[:, :, 1]   # e_xx_dot
-    c.tmp2 .= @view du[:, :, 2]   # e_yy_dot
-    c.tmp3 .= @view du[:, :, 3]   # 2e_xy_dot
+    elastic = sum(wJq .* elastic_density)
+    kinetic = sum(wJq .* kinetic_density)
+    temperature = sum(wJq .* temperature_density)
+    heat_flux = sum(wJq .* heat_flux_density)
+    relaxation = sum(wJq .* relaxation_density)
+    total = elastic + kinetic + temperature + heat_flux
 
-    @. du[:, :, 1] = c11 * c.tmp1 + c12 * c.tmp2 - β * ψ
-    @. du[:, :, 2] = c12 * c.tmp1 + c22 * c.tmp2 - β * ψ
-    @. du[:, :, 3] = c33 * c.tmp3
-
-    # Temperature equation
-    @. du[:, :, 6] = ψ
-
-    # Relaxation equation: safer version without τ divΠ
-    # @. du[:, :, 7] =
-    #     (γ * c.lapT -
-    #      q_source -
-    #      T0 * β * (c.tmp1 + c.tmp2)) / cT -
-    #     ψ / τ
-
-    # Full model version:
-    @. du[:, :, 7] =
-        (γ * c.lapT -
-         q_source -
-         T0 * β * ((c.tmp1 + c.tmp2) + τ * c.divPi)) / cT -
-        ψ / τ
-
-    @. du[:, :, 5] += pt_src * rick(time, 20.0)
-    @. du[:, :, 7] += pt_src * rick(time, 20.0)
-
-
-    return nothing
-end
-
-function compute_cfl(c, dt, md, rd)
-    h = minimum(sqrt.(md.J))
-    return (rd.N + 1)^2 * c * dt / h
+    return (; elastic, kinetic, temperature, heat_flux, total, relaxation)
 end
 
 
-function compute_dt(c11, ρ, τ, md; CFL_target = 0.02)
-    # element size
-    h = minimum(sqrt.(md.J))
+"""
+    energy_balance(u, du, rd, md, material;
+                   source_supply=0, source_spatial=nothing)
 
-    # wave speed
-    c = sqrt(c11 / ρ)
+Evaluate the instantaneous semi-discrete energy identity
 
-    # time step limits
-    dt_elastic = CFL_target * h / c
-    dt_relax   = CFL_target * τ
+    dE/dt + D_rel + D_mech + D_BR1 = P_source.
 
-    dt = min(dt_elastic, dt_relax)
+`du` must be the result of `rhs_thermoelastic_br1!(du,u,...)` at the same
+state and time.  Interior-face integrals are assembled from both element
+sides and divided by two.  The returned `residual` should be near roundoff
+for a periodic constant-coefficient SBP/DGSEM mesh, up to time-integration
+and floating-point errors in the supplied state.
+"""
+function energy_balance(
+    u,
+    du,
+    rd,
+    md,
+    material::ThermoelasticMaterial;
+    source_supply::Real=0.0,
+    source_spatial=nothing,
+)
+    (; Vq, Vf, wf) = rd
+    (; wJq, Jf, nx, ny, mapP) = md
 
-    return dt, h, c
+    @views begin
+        sxxq = Vq * u[:, :, ISXX]
+        szzq = Vq * u[:, :, ISZZ]
+        sxzq = Vq * u[:, :, ISXZ]
+        vxq = Vq * u[:, :, IVX]
+        vzq = Vq * u[:, :, IVZ]
+        thetaq = Vq * u[:, :, ITHETA]
+        qxq = Vq * u[:, :, IQX]
+        qzq = Vq * u[:, :, IQZ]
+
+        dsxxq = Vq * du[:, :, ISXX]
+        dszzq = Vq * du[:, :, ISZZ]
+        dsxzq = Vq * du[:, :, ISXZ]
+        dvxq = Vq * du[:, :, IVX]
+        dvzq = Vq * du[:, :, IVZ]
+        dthetaq = Vq * du[:, :, ITHETA]
+        dqxq = Vq * du[:, :, IQX]
+        dqzq = Vq * du[:, :, IQZ]
+    end
+
+    S = material.S
+    Kinv = material.Kinv
+
+    epsxxq = @. S[1, 1] * sxxq + S[1, 2] * szzq + S[1, 3] * sxzq
+    epszzq = @. S[2, 1] * sxxq + S[2, 2] * szzq + S[2, 3] * sxzq
+    gammaxzq = @. S[3, 1] * sxxq + S[3, 2] * szzq + S[3, 3] * sxzq
+
+    Kiqx = @. Kinv[1, 1] * qxq + Kinv[1, 2] * qzq
+    Kiqz = @. Kinv[2, 1] * qxq + Kinv[2, 2] * qzq
+
+    energy_rate_density = @. (
+        epsxxq * dsxxq +
+        epszzq * dszzq +
+        gammaxzq * dsxzq +
+        material.rho * (vxq * dvxq + vzq * dvzq) +
+        (material.heat_capacity / material.Tref) * thetaq * dthetaq +
+        (material.tau / material.Tref) * (Kiqx * dqxq + Kiqz * dqzq)
+    )
+
+    denergy_dt = sum(wJq .* energy_rate_density)
+    relaxation = sum(wJq .* (@. (qxq * Kiqx + qzq * Kiqz) / material.Tref))
+
+    # Reconstruct total stress and face jumps.
+    @views begin
+        sigxx = @. u[:, :, ISXX] - material.b[1] * u[:, :, ITHETA]
+        sigzz = @. u[:, :, ISZZ] - material.b[2] * u[:, :, ITHETA]
+        sigxz = @. u[:, :, ISXZ] - material.b[3] * u[:, :, ITHETA]
+
+        sigxxf = Vf * sigxx
+        sigzzf = Vf * sigzz
+        sigxzf = Vf * sigxz
+        vxf = Vf * u[:, :, IVX]
+        vzf = Vf * u[:, :, IVZ]
+        thetaf = Vf * u[:, :, ITHETA]
+    end
+
+    dsigxx = sigxxf[mapP] - sigxxf
+    dsigzz = sigzzf[mapP] - sigzzf
+    dsigxz = sigxzf[mapP] - sigxzf
+    dvx = vxf[mapP] - vxf
+    dvz = vzf[mapP] - vzf
+    dtheta = thetaf[mapP] - thetaf
+
+    dtx = @. nx * dsigxx + ny * dsigxz
+    dtz = @. nx * dsigxz + ny * dsigzz
+
+    # A_n[[v]] in engineering-shear Voigt ordering.
+    anv1 = @. nx * dvx
+    anv2 = @. ny * dvz
+    anv3 = @. ny * dvx + nx * dvz
+
+    mechanical_density = @. (
+        0.5 * material.alpha_sigma * (dtx^2 + dtz^2) +
+        0.5 * material.alpha_v * (anv1^2 + anv2^2 + anv3^2)
+    )
+
+    thermal_density = @. (
+        (material.eta_br1 / material.Tref) * dtheta^2
+    )
+
+    face_weights = reshape(wf, :, 1) .* Jf
+    # Every periodic interior face is represented once from each neighboring
+    # element, hence the factor 1/2.
+    mechanical_face = 0.5 * sum(face_weights .* mechanical_density)
+    thermal_face = 0.5 * sum(face_weights .* thermal_density)
+
+    source_power = zero(denergy_dt)
+    if source_spatial !== nothing && !iszero(source_supply)
+        sourceq = Vq * source_spatial
+        source_power = source_supply / material.Tref * sum(wJq .* thetaq .* sourceq)
+    end
+
+    residual = denergy_dt + relaxation + mechanical_face + thermal_face - source_power
+
+    return (;
+        denergy_dt,
+        relaxation,
+        mechanical_face,
+        thermal_face,
+        source_power,
+        residual,
+    )
 end
 
-
-
-function rick(t, f0)
-    tR = 1 / f0
-    return 1e1 * (1 .- 2 * (π * f0 * (t .- tR)) .^ 2) .* exp.(-(π * f0 * (t .- tR)) .^ 2)
+function interpolate_state(rd, u)
+    nplot = size(rd.Vp, 1)
+    K = size(u, 2)
+    result = Array{eltype(u)}(undef, nplot, K, NSTATE)
+    @views for field in 1:NSTATE
+        mul!(result[:, :, field], rd.Vp, u[:, :, field])
+    end
+    return result
 end
 
+"""
+    export_quad_subcells_vtu(filename, x, z, uplot, material)
 
-function export_quad_subcells_vtu(filename, x, y, u)
-    @assert size(x) == size(y)
-    @assert ndims(u) == 3
+Export the eight primary fields together with the reconstructed total stress.
+`x`, `z`, and `uplot` must already be interpolated with `rd.Vp`.
+"""
+function export_quad_subcells_vtu(
+    filename::AbstractString,
+    x::AbstractMatrix,
+    z::AbstractMatrix,
+    uplot::AbstractArray,
+    material::ThermoelasticMaterial,
+)
+    size(x) == size(z) || throw(DimensionMismatch("x and z must have the same size"))
+    ndims(uplot) == 3 || throw(DimensionMismatch("uplot must be a three-dimensional array"))
 
     Np, K = size(x)
-    @assert size(u, 1) == Np
-    @assert size(u, 2) == K
+    size(uplot, 1) == Np || throw(DimensionMismatch("uplot point count does not match x"))
+    size(uplot, 2) == K || throw(DimensionMismatch("uplot element count does not match x"))
+    size(uplot, 3) == NSTATE || throw(DimensionMismatch("uplot must contain $NSTATE fields"))
 
-    q = round(Int, sqrt(Np))
-    @assert q * q == Np "Np must be a perfect square."
-    n1 = q
+    n1 = round(Int, sqrt(Np))
+    n1 * n1 == Np || throw(ArgumentError("plotting points per element must be a perfect square"))
 
-    npts = Np * K
-    points = Matrix{Float64}(undef, 3, npts)
-
-    field_names = ["sigma_xx", "sigma_yy", "sigma_xy", "v1", "v2", "T", "psi"]
-    vals = [Vector{Float64}(undef, npts) for _ in 1:7]
-
-    for k in 1:K
-        off = (k - 1) * Np
-
-        for i in 1:Np
-            gid = off + i
-
-            points[1, gid] = x[i, k]
-            points[2, gid] = y[i, k]
-            points[3, gid] = 0.0
-
-            for fld in 1:7
-                vals[fld][gid] = u[i, k, fld]
-            end
-        end
-    end
+    npoints = Np * K
+    points = Matrix{Float64}(undef, 3, npoints)
+    points[1, :] .= vec(x)
+    points[2, :] .= vec(z)
+    points[3, :] .= 0.0
 
     cells = MeshCell[]
-
     for k in 1:K
-        off = (k - 1) * Np
-        local_ids = reshape(collect(1:Np), n1, n1)
-
-        for j in 1:n1-1, i in 1:n1-1
-            a = off + local_ids[i, j]
-            b = off + local_ids[i+1, j]
-            c = off + local_ids[i+1, j+1]
-            d = off + local_ids[i, j+1]
-
-            # Use the same working indexing convention as your code.
+        offset = (k - 1) * Np
+        ids = reshape(collect(1:Np), n1, n1)
+        for j in 1:(n1 - 1), i in 1:(n1 - 1)
+            a = offset + ids[i, j]
+            b = offset + ids[i + 1, j]
+            c = offset + ids[i + 1, j + 1]
+            d = offset + ids[i, j + 1]
             push!(cells, MeshCell(VTKCellTypes.VTK_TRIANGLE, [a, b, c]))
             push!(cells, MeshCell(VTKCellTypes.VTK_TRIANGLE, [a, c, d]))
         end
     end
 
-    vtk_grid(filename, points, cells) do vtk
-        for fld in 1:7
-            vtk[field_names[fld], VTKPointData()] = vals[fld]
+    @views begin
+        sxx = uplot[:, :, ISXX]
+        szz = uplot[:, :, ISZZ]
+        sxz = uplot[:, :, ISXZ]
+        theta = uplot[:, :, ITHETA]
+
+        sigxx = @. sxx - material.b[1] * theta
+        sigzz = @. szz - material.b[2] * theta
+        sigxz = @. sxz - material.b[3] * theta
+
+        base = endswith(lowercase(filename), ".vtu") ? filename[1:(end - 4)] : filename
+        vtk_grid(base, points, cells) do vtk
+            vtk["elastic_s_xx", VTKPointData()] = vec(sxx)
+            vtk["elastic_s_zz", VTKPointData()] = vec(szz)
+            vtk["elastic_s_xz", VTKPointData()] = vec(sxz)
+            vtk["total_sigma_xx", VTKPointData()] = vec(sigxx)
+            vtk["total_sigma_zz", VTKPointData()] = vec(sigzz)
+            vtk["total_sigma_xz", VTKPointData()] = vec(sigxz)
+            vtk["v_x", VTKPointData()] = vec(uplot[:, :, IVX])
+            vtk["v_z", VTKPointData()] = vec(uplot[:, :, IVZ])
+            vtk["theta", VTKPointData()] = vec(theta)
+            vtk["q_x", VTKPointData()] = vec(uplot[:, :, IQX])
+            vtk["q_z", VTKPointData()] = vec(uplot[:, :, IQZ])
         end
+
+        return base * ".vtu"
     end
-
-    return nothing
 end
 
-
-function make_progress_callback(tspan, dt, CFL)
-
-    nsteps = ceil(Int, (tspan[2] - tspan[1]) / dt)
-    prog = Progress(nsteps; desc="Solving", showspeed=true)
-
-    step_counter = Ref(0)
-    t_start = time()
-
-    function progress_cb(integrator)
-        t = integrator.t
-
-        step_counter[] += 1
-        elapsed = time() - t_start
-        steps_per_sec = step_counter[] / max(elapsed, eps())
-        eta = (nsteps - step_counter[]) / max(steps_per_sec, eps())
-
-        ProgressMeter.next!(prog; showvalues=[
-            (:t, @sprintf("%.3e", t)),
-            (:CFL, @sprintf("%.3e", CFL)),
-            (:steps_per_sec, @sprintf("%.1f", steps_per_sec)),
-            (:ETA, @sprintf("%.1f", eta))
-        ])
-        return nothing
-    end
-
-    return DiscreteCallback((u,t,integrator)->true, progress_cb;
-                            save_positions=(false,false))
-end
-
-end
+end # module DG
