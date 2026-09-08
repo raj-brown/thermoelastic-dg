@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "julia",
+      "request": "launch",
+      "name": "Run case 1",
+      "program": "${workspaceFolder}/main.jl",
+      "args": ["case_1"],
+      "project": "${workspaceFolder}"
+    },
+    {
+      "type": "julia",
+      "request": "launch",
+      "name": "Run case 2",
+      "program": "${workspaceFolder}/main.jl",
+      "args": ["case_2"],
+      "project": "${workspaceFolder}"
+    },
+    {
+      "type": "julia",
+      "request": "launch",
+      "name": "Run all cases",
+      "program": "${workspaceFolder}/main.jl",
+      "args": ["all"],
+      "project": "${workspaceFolder}"
+    }
+  ]
+}

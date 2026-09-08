@@ -3,22 +3,6 @@ module DG
 # Thermoelastic model and experiment:
 #   J. M. Carcione et al., Geophysics 84 (2019), T1-T11,
 #   DOI 10.1190/geo2018-0448.1.
-#
-# Mechanical penalty flux:
-#   K. Shukla, J. Chan, M. V. de Hoop, and P. Jaiswal,
-#   Journal of Computational Physics 403 (2020), 109061,
-#   DOI 10.1016/j.jcp.2019.109061.
-#
-# The face corrections retain the precise Chan--Shukla structure
-#
-#   A_n(v_hat-v^-) = 1/2 A_n[[v]]
-#                    + alpha_sigma/2 A_n A_n'[[Sigma]],
-#
-#   t_hat-t^-       = 1/2 A_n'[[Sigma]]
-#                    + alpha_v/2 A_n' A_n[[v]],
-#
-# with [[u]]=u^+-u^- and total thermoelastic stress Sigma=s-b*theta.
-
 using LinearAlgebra
 using WriteVTK
 
@@ -40,6 +24,12 @@ export energy_components
 export energy_balance
 export interpolate_state
 export export_quad_subcells_vtu
+export ManufacturedSolution
+export manufactured_material
+export manufactured_state!
+export add_manufactured_forcing!
+export rhs_thermoelastic_mms!
+export manufactured_errors
 export NSTATE, STATE_FIELD_NAMES
 export ISXX, ISZZ, ISXZ, IVX, IVZ, ITHETA, IQX, IQZ
 
@@ -290,18 +280,38 @@ end
 # Carcione heat-source pulse and spatial regularization
 # -----------------------------------------------------------------------------
 """
-    carcione_pulse(t, f0, t0=3/(2*f0))
+    carcione_pulse(t, f0, t0=3/(2*f0); mode=:printed)
 
-The source history printed as equation (35) by Carcione et al.:
+Return the Gaussian-modulated source pulse.  Two conventions are retained
+because equation (35) in Carcione et al. is printed without `2*pi`, while
+`f0` is described in MHz:
 
-    cos((t-t0)*f0) * exp(-2*(t-t0)^2*f0^2).
+* `mode=:printed` uses the equation exactly as typeset,
+  `cos(f0*(t-t0))*exp(-2*(f0*(t-t0))^2)`.
+* `mode=:cyclic_hz` interprets `f0` as cycles/s,
+  `cos(2*pi*f0*(t-t0))*exp(-2*(f0*(t-t0))^2)`.
 
-No factor of `2*pi` is inserted because this routine follows the published
-formula literally.
+The second convention produces a pulse whose carrier is actually 3.5 MHz and
+is useful when reproducing the appearance of Figure 7.  Both conventions are
+available so the ambiguity is explicit rather than hidden.
 """
-@inline function carcione_pulse(t, f0, t0=3 / (2 * f0))
+@inline function carcione_pulse(
+    t,
+    f0,
+    t0=3 / (2 * f0);
+    mode::Symbol=:printed,
+)
     xi = (t - t0) * f0
-    return cos(xi) * exp(-2 * xi^2)
+    if mode === :printed
+        return cos(xi) * exp(-2 * xi^2)
+    elseif mode === :cyclic_hz
+        return cospi(2 * xi) * exp(-2 * xi^2)
+    else
+        throw(ArgumentError(
+            "unknown Carcione pulse mode $(repr(mode)); " *
+            "use :printed or :cyclic_hz",
+        ))
+    end
 end
 
 struct CarcioneHeatSource{T,A<:AbstractMatrix{T},V<:AbstractVector{T}}
@@ -312,14 +322,19 @@ struct CarcioneHeatSource{T,A<:AbstractMatrix{T},V<:AbstractVector{T}}
     tau::T
     tmax::T
     filter_dt::T
+    wavelet_mode::Symbol
     supply_history::V
 end
 
 """
     CarcioneHeatSource(spatial; amplitude=1, f0=3.5e6,
-                       t0=3/(2*f0), tau, tmax, filter_dt=nothing)
+                       t0=3/(2*f0), tau, tmax, filter_dt=nothing,
+                       wavelet_mode=:printed)
 
-Construct the centered heat source used for the Figure 6 configuration.
+Construct the centered heat source.  `wavelet_mode` is forwarded to
+`carcione_pulse`; use `:printed` for the literal equation (35) or
+`:cyclic_hz` when `f0` is interpreted as cycles per second.
+
 `amplitude*carcione_pulse(t,f0,t0)` is Carcione's source `q(t)` in
 
     K*Delta(theta) = c*(theta_t + tau*theta_tt)
@@ -337,7 +352,7 @@ this constructor precomputes the causal scalar filter
     tau*r_t + r = -q(t),    r(0)=0.
 
 The filter is integrated with RK4 on a uniform subgrid.  The default filter
-step resolves both the relaxation time and the published source pulse.
+step resolves both the relaxation time and the source pulse.
 """
 function CarcioneHeatSource(
     spatial::AbstractMatrix;
@@ -347,7 +362,12 @@ function CarcioneHeatSource(
     tau::Real,
     tmax::Real,
     filter_dt=nothing,
+    wavelet_mode::Symbol=:printed,
 )
+    wavelet_mode in (:printed, :cyclic_hz) || throw(ArgumentError(
+        "wavelet_mode must be :printed or :cyclic_hz",
+    ))
+
     T = promote_type(
         Float64,
         eltype(spatial),
@@ -379,7 +399,12 @@ function CarcioneHeatSource(
     dtT = tmaxT / nsteps
     history = zeros(T, nsteps + 1)
 
-    qpaper(t) = amplitudeT * carcione_pulse(t, f0T, t0T)
+    qpaper(t) = amplitudeT * carcione_pulse(
+        t,
+        f0T,
+        t0T;
+        mode=wavelet_mode,
+    )
     source_rhs(t, r) = (-qpaper(t) - r) / tauT
 
     @inbounds for n in 1:nsteps
@@ -400,13 +425,19 @@ function CarcioneHeatSource(
         tauT,
         tmaxT,
         dtT,
+        wavelet_mode,
         history,
     )
 end
 
-"""Return Carcione's published second-order heat-source history `q(t)`."""
+"""Return Carcione's second-order heat-source history `q(t)`."""
 @inline paper_heat_source(source::CarcioneHeatSource, t) =
-    source.amplitude * carcione_pulse(t, source.f0, source.t0)
+    source.amplitude * carcione_pulse(
+        t,
+        source.f0,
+        source.t0;
+        mode=source.wavelet_mode,
+    )
 
 """
     first_order_heat_supply(source, t)
@@ -563,12 +594,14 @@ numerical flux is the scalar Chan--Shukla penalty flux, with total stress
 `Sigma = s - b*theta`.  Temperature is weak and heat flux is strong, using
 BR1 traces.  `eta_br1 = 0` gives pure BR1.
 
-`parameters` must provide `rd`, `md`, `material`, `cache`, and `source`.
-The mesh is assumed periodic in this experiment, so every face has a valid
-neighbor in `mapP`.
+`parameters` must provide `rd`, `md`, `material`, and `cache`.  A physical
+heat source is optional; omit `source` or set it to `nothing` for a source-free
+problem.  The mesh is assumed periodic in this experiment, so every face has
+a valid neighbor in `mapP`.
 """
 function rhs_thermoelastic_br1!(du, u, parameters, time)
-    (; rd, md, material, cache, source) = parameters
+    (; rd, md, material, cache) = parameters
+    source = hasproperty(parameters, :source) ? getproperty(parameters, :source) : nothing
     (; Vf, Dr, Ds, LIFT) = rd
     (; rxJ, sxJ, ryJ, syJ, nx, ny, J, Jf, mapP) = md
 
@@ -798,12 +831,19 @@ function rhs_thermoelastic_br1!(du, u, parameters, time)
         mul!(liftvol, LIFT, liftbuf)
         @. divq = (divq + liftvol) / J
 
-        source_supply = first_order_heat_supply(source, time)
-        @. dtheta_dt = (
-            source_supply * source.spatial -
-            m.Tref * (b1 * epsxx + b2 * epszz + b3 * gammaxz) -
-            divq
-        ) / m.heat_capacity
+        if source === nothing
+            @. dtheta_dt = (
+                -m.Tref * (b1 * epsxx + b2 * epszz + b3 * gammaxz) -
+                divq
+            ) / m.heat_capacity
+        else
+            source_supply = first_order_heat_supply(source, time)
+            @. dtheta_dt = (
+                source_supply * source.spatial -
+                m.Tref * (b1 * epsxx + b2 * epszz + b3 * gammaxz) -
+                divq
+            ) / m.heat_capacity
+        end
 
         # -----------------------------------------------------------------
         # Strong Cattaneo heat-flux equation with the BR1 theta trace
@@ -826,6 +866,409 @@ function rhs_thermoelastic_br1!(du, u, parameters, time)
     end
 
     return nothing
+end
+
+# -----------------------------------------------------------------------------
+# Periodic manufactured solution and convergence diagnostics
+# -----------------------------------------------------------------------------
+
+"""
+    ManufacturedSolution(; kx=pi, kz=pi, omega=1.3, phase_x=0.23, phase_z=-0.31, amplitudes=(...))
+
+Parameters for a smooth periodic manufactured solution on `[-1,1]^2`.
+The eight amplitudes correspond to
+
+    [s_xx, s_zz, s_xz, v_x, v_z, theta, q_x, q_z].
+
+The trigonometric fields are deliberately independent, so the manufactured
+forcing exercises every mechanical, thermoelastic, conductivity, and
+Cattaneo-relaxation term in `rhs_thermoelastic_br1!`.
+"""
+struct ManufacturedSolution{T}
+    kx::T
+    kz::T
+    omega::T
+    phase_x::T
+    phase_z::T
+    amplitudes::NTuple{NSTATE,T}
+end
+
+function ManufacturedSolution(;
+    kx::Real=pi,
+    kz::Real=pi,
+    omega::Real=1.3,
+    phase_x::Real=0.23,
+    phase_z::Real=-0.31,
+    amplitudes=(0.8, -0.6, 0.5, 0.7, -0.9, 0.4, 0.3, -0.2),
+)
+    length(amplitudes) == NSTATE ||
+        throw(ArgumentError("amplitudes must contain $NSTATE entries"))
+
+    T = promote_type(
+        Float64,
+        typeof(kx),
+        typeof(kz),
+        typeof(omega),
+        typeof(phase_x),
+        typeof(phase_z),
+        map(typeof, amplitudes)...,
+    )
+    amps = ntuple(i -> convert(T, amplitudes[i]), NSTATE)
+    return ManufacturedSolution(
+        convert(T, kx),
+        convert(T, kz),
+        convert(T, omega),
+        convert(T, phase_x),
+        convert(T, phase_z),
+        amps,
+    )
+end
+
+"""
+    manufactured_material(; penalty_scale=1, br1_penalty_scale=0.25)
+
+Return an O(1), homogeneous anisotropic material for the manufactured-solution
+study.  Both the stiffness matrix and conductivity tensor are symmetric
+positive definite, and the thermal-stress vector has a nonzero shear entry.
+This makes the test exercise the anisotropic code path without the very small
+physical relaxation time of the Carcione benchmark.
+"""
+function manufactured_material(;
+    penalty_scale::Real=1.0,
+    br1_penalty_scale::Real=0.25,
+)
+    C = [
+        4.0   1.0    0.25
+        1.0   3.0   -0.15
+        0.25 -0.15   1.20
+    ]
+    b = [0.30, -0.20, 0.10]
+    K = [0.80 0.12; 0.12 0.60]
+
+    return make_material(
+        rho=1.30,
+        C=C,
+        b=b,
+        heat_capacity=1.70,
+        Tref=1.20,
+        K=K,
+        tau=0.40,
+        penalty_scale=penalty_scale,
+        br1_penalty_scale=br1_penalty_scale,
+    )
+end
+
+"""
+    manufactured_state!(u, x, z, time, mms)
+
+Fill `u` with the exact periodic manufactured state.  The coordinates may be
+solution nodes, quadrature nodes, or plotting nodes, provided `x` and `z` have
+the same two-dimensional shape as the first two dimensions of `u`.
+"""
+function manufactured_state!(
+    u::AbstractArray,
+    x::AbstractMatrix,
+    z::AbstractMatrix,
+    time,
+    mms::ManufacturedSolution,
+)
+    size(x) == size(z) || throw(DimensionMismatch("x and z must have the same size"))
+    size(u, 1) == size(x, 1) || throw(DimensionMismatch("u and x have different point counts"))
+    size(u, 2) == size(x, 2) || throw(DimensionMismatch("u and x have different element counts"))
+    size(u, 3) == NSTATE || throw(DimensionMismatch("u must contain $NSTATE fields"))
+
+    a1, a2, a3, a4, a5, a6, a7, a8 = mms.amplitudes
+    st, ct = sincos(mms.omega * time)
+
+    @inbounds for k in axes(x, 2), i in axes(x, 1)
+        sx, cx = sincos(mms.kx * x[i, k] + mms.phase_x)
+        sz, cz = sincos(mms.kz * z[i, k] + mms.phase_z)
+
+        u[i, k, ISXX]   =  a1 * sx * cz * ct
+        u[i, k, ISZZ]   =  a2 * cx * sz * st
+        u[i, k, ISXZ]   =  a3 * sx * sz * ct
+        u[i, k, IVX]    =  a4 * cx * cz * st
+        u[i, k, IVZ]    =  a5 * sx * cz * ct
+        u[i, k, ITHETA] =  a6 * cx * sz * ct
+        u[i, k, IQX]    =  a7 * sx * sz * st
+        u[i, k, IQZ]    =  a8 * cx * cz * ct
+    end
+
+    return u
+end
+
+"""
+    add_manufactured_forcing!(du, x, z, time, material, mms)
+
+Add the exact source terms needed to make `manufactured_state!` solve the
+complete first-order thermoelastic-Cattaneo system.  The additions are made
+in state-rate form:
+
+    s_t     = C E(v)                         + f_s,
+    v_t     = rho^(-1) div(s - b theta)      + f_v,
+    theta_t = -(Tref b' E(v) + div(q))/c     + f_theta,
+    q_t     = -(q + K grad(theta))/tau       + f_q.
+
+Consequently, this routine can be added directly after the homogeneous DG
+operator, without changing the numerical fluxes.
+"""
+function add_manufactured_forcing!(
+    du::AbstractArray,
+    x::AbstractMatrix,
+    z::AbstractMatrix,
+    time,
+    material::ThermoelasticMaterial,
+    mms::ManufacturedSolution,
+)
+    size(du, 1) == size(x, 1) || throw(DimensionMismatch("du and x have different point counts"))
+    size(du, 2) == size(x, 2) || throw(DimensionMismatch("du and x have different element counts"))
+    size(du, 3) == NSTATE || throw(DimensionMismatch("du must contain $NSTATE fields"))
+
+    C11 = material.C[1, 1]
+    C12 = material.C[1, 2]
+    C13 = material.C[1, 3]
+    C22 = material.C[2, 2]
+    C23 = material.C[2, 3]
+    C33 = material.C[3, 3]
+
+    b1, b2, b3 = material.b
+    K11 = material.K[1, 1]
+    K12 = material.K[1, 2]
+    K21 = material.K[2, 1]
+    K22 = material.K[2, 2]
+
+    rho = material.rho
+    heat_capacity = material.heat_capacity
+    Tref = material.Tref
+    tau = material.tau
+
+    kx = mms.kx
+    kz = mms.kz
+    omega = mms.omega
+    a1, a2, a3, a4, a5, a6, a7, a8 = mms.amplitudes
+    st, ct = sincos(omega * time)
+
+    @inbounds for k in axes(x, 2), i in axes(x, 1)
+        sx, cx = sincos(kx * x[i, k] + mms.phase_x)
+        sz, cz = sincos(kz * z[i, k] + mms.phase_z)
+
+        # Exact state values needed by the Cattaneo forcing.
+        qx = a7 * sx * sz * st
+        qz = a8 * cx * cz * ct
+
+        # Exact time derivatives.
+        sxx_t = -a1 * omega * sx * cz * st
+        szz_t =  a2 * omega * cx * sz * ct
+        sxz_t = -a3 * omega * sx * sz * st
+        vx_t =    a4 * omega * cx * cz * ct
+        vz_t =   -a5 * omega * sx * cz * st
+        theta_t = -a6 * omega * cx * sz * st
+        qx_t =    a7 * omega * sx * sz * ct
+        qz_t =   -a8 * omega * cx * cz * st
+
+        # Velocity derivatives and engineering-shear strain rate.
+        vx_x = -a4 * kx * sx * cz * st
+        vx_z = -a4 * kz * cx * sz * st
+        vz_x =  a5 * kx * cx * cz * ct
+        vz_z = -a5 * kz * sx * sz * ct
+
+        epsxx = vx_x
+        epszz = vz_z
+        gammaxz = vx_z + vz_x
+
+        # Derivatives of elastic stress and temperature.
+        sxx_x =  a1 * kx * cx * cz * ct
+        szz_z =  a2 * kz * cx * cz * st
+        sxz_x =  a3 * kx * cx * sz * ct
+        sxz_z =  a3 * kz * sx * cz * ct
+        theta_x = -a6 * kx * sx * sz * ct
+        theta_z =  a6 * kz * cx * cz * ct
+
+        # Total stress Sigma = s - b theta.
+        divsig_x = (sxx_x - b1 * theta_x) + (sxz_z - b3 * theta_z)
+        divsig_z = (sxz_x - b3 * theta_x) + (szz_z - b2 * theta_z)
+
+        # Divergence of the exact heat flux.
+        qx_x =  a7 * kx * cx * sz * st
+        qz_z = -a8 * kz * cx * sz * ct
+        divq = qx_x + qz_z
+
+        b_dot_eps = b1 * epsxx + b2 * epszz + b3 * gammaxz
+
+        # Exact constitutive rate C E(v).
+        constitutive_xx = C11 * epsxx + C12 * epszz + C13 * gammaxz
+        constitutive_zz = C12 * epsxx + C22 * epszz + C23 * gammaxz
+        constitutive_xz = C13 * epsxx + C23 * epszz + C33 * gammaxz
+
+        # Add state-rate forcing.
+        du[i, k, ISXX] += sxx_t - constitutive_xx
+        du[i, k, ISZZ] += szz_t - constitutive_zz
+        du[i, k, ISXZ] += sxz_t - constitutive_xz
+
+        du[i, k, IVX] += vx_t - divsig_x / rho
+        du[i, k, IVZ] += vz_t - divsig_z / rho
+
+        du[i, k, ITHETA] +=
+            theta_t + (Tref * b_dot_eps + divq) / heat_capacity
+
+        du[i, k, IQX] +=
+            qx_t + (qx + K11 * theta_x + K12 * theta_z) / tau
+        du[i, k, IQZ] +=
+            qz_t + (qz + K21 * theta_x + K22 * theta_z) / tau
+    end
+
+    return nothing
+end
+
+"""
+    rhs_thermoelastic_mms!(du, u, parameters, time)
+
+Manufactured-solution wrapper around `rhs_thermoelastic_br1!`.  The parameter
+container must provide `mms` in addition to the standard DG parameters.  No
+physical heat source is required; omit `source` or set it to `nothing`.
+"""
+function rhs_thermoelastic_mms!(du, u, parameters, time)
+    rhs_thermoelastic_br1!(du, u, parameters, time)
+    add_manufactured_forcing!(
+        du,
+        parameters.md.x,
+        parameters.md.y,
+        time,
+        parameters.material,
+        parameters.mms,
+    )
+    return nothing
+end
+
+"""
+    manufactured_errors(u, rd, md, material, mms, time)
+
+Compute componentwise absolute and relative L2 errors, an unweighted combined
+L2 error, and the physically weighted thermoelastic energy-norm error.  All
+integrals use the volume quadrature stored in `rd` and `md`.
+"""
+function manufactured_errors(
+    u::AbstractArray,
+    rd,
+    md,
+    material::ThermoelasticMaterial,
+    mms::ManufacturedSolution,
+    time,
+)
+    (; Vq) = rd
+    (; wJq) = md
+
+    nq = size(Vq, 1)
+    nelements = size(u, 2)
+    T = promote_type(eltype(u), eltype(wJq), typeof(time))
+
+    numerical = Array{T}(undef, nq, nelements, NSTATE)
+    exact = similar(numerical)
+
+    @views for field in 1:NSTATE
+        mul!(numerical[:, :, field], Vq, u[:, :, field])
+    end
+
+    xq = Vq * md.x
+    zq = Vq * md.y
+    manufactured_state!(exact, xq, zq, time, mms)
+
+    component_absolute = zeros(T, NSTATE)
+    component_exact = zeros(T, NSTATE)
+
+    @inbounds for field in 1:NSTATE
+        error_squared = zero(T)
+        exact_squared = zero(T)
+        for k in axes(wJq, 2), i in axes(wJq, 1)
+            weight = wJq[i, k]
+            difference = numerical[i, k, field] - exact[i, k, field]
+            error_squared += weight * difference^2
+            exact_squared += weight * exact[i, k, field]^2
+        end
+        component_absolute[field] = sqrt(max(error_squared, zero(T)))
+        component_exact[field] = sqrt(max(exact_squared, zero(T)))
+    end
+
+    component_relative = similar(component_absolute)
+    @inbounds for field in 1:NSTATE
+        component_relative[field] = component_absolute[field] /
+            max(component_exact[field], eps(T))
+    end
+
+    combined_absolute = norm(component_absolute)
+    combined_exact = norm(component_exact)
+    combined_relative = combined_absolute / max(combined_exact, eps(T))
+
+    S = material.S
+    Kinv = material.Kinv
+    energy_error_squared = zero(T)
+    energy_exact_squared = zero(T)
+
+    @inbounds for k in axes(wJq, 2), i in axes(wJq, 1)
+        weight = wJq[i, k]
+
+        es1 = numerical[i, k, ISXX] - exact[i, k, ISXX]
+        es2 = numerical[i, k, ISZZ] - exact[i, k, ISZZ]
+        es3 = numerical[i, k, ISXZ] - exact[i, k, ISXZ]
+        ev1 = numerical[i, k, IVX] - exact[i, k, IVX]
+        ev2 = numerical[i, k, IVZ] - exact[i, k, IVZ]
+        etheta = numerical[i, k, ITHETA] - exact[i, k, ITHETA]
+        eq1 = numerical[i, k, IQX] - exact[i, k, IQX]
+        eq2 = numerical[i, k, IQZ] - exact[i, k, IQZ]
+
+        stress_error =
+            es1 * (S[1, 1] * es1 + S[1, 2] * es2 + S[1, 3] * es3) +
+            es2 * (S[2, 1] * es1 + S[2, 2] * es2 + S[2, 3] * es3) +
+            es3 * (S[3, 1] * es1 + S[3, 2] * es2 + S[3, 3] * es3)
+        flux_error =
+            eq1 * (Kinv[1, 1] * eq1 + Kinv[1, 2] * eq2) +
+            eq2 * (Kinv[2, 1] * eq1 + Kinv[2, 2] * eq2)
+
+        energy_error_density =
+            stress_error +
+            material.rho * (ev1^2 + ev2^2) +
+            material.heat_capacity / material.Tref * etheta^2 +
+            material.tau / material.Tref * flux_error
+
+        xs1 = exact[i, k, ISXX]
+        xs2 = exact[i, k, ISZZ]
+        xs3 = exact[i, k, ISXZ]
+        xv1 = exact[i, k, IVX]
+        xv2 = exact[i, k, IVZ]
+        xtheta = exact[i, k, ITHETA]
+        xq1 = exact[i, k, IQX]
+        xq2 = exact[i, k, IQZ]
+
+        stress_exact =
+            xs1 * (S[1, 1] * xs1 + S[1, 2] * xs2 + S[1, 3] * xs3) +
+            xs2 * (S[2, 1] * xs1 + S[2, 2] * xs2 + S[2, 3] * xs3) +
+            xs3 * (S[3, 1] * xs1 + S[3, 2] * xs2 + S[3, 3] * xs3)
+        flux_exact =
+            xq1 * (Kinv[1, 1] * xq1 + Kinv[1, 2] * xq2) +
+            xq2 * (Kinv[2, 1] * xq1 + Kinv[2, 2] * xq2)
+
+        energy_exact_density =
+            stress_exact +
+            material.rho * (xv1^2 + xv2^2) +
+            material.heat_capacity / material.Tref * xtheta^2 +
+            material.tau / material.Tref * flux_exact
+
+        energy_error_squared += weight * energy_error_density
+        energy_exact_squared += weight * energy_exact_density
+    end
+
+    energy_absolute = sqrt(max(energy_error_squared, zero(T)))
+    energy_exact = sqrt(max(energy_exact_squared, zero(T)))
+    energy_relative = energy_absolute / max(energy_exact, eps(T))
+
+    return (;
+        component_absolute,
+        component_relative,
+        combined_absolute,
+        combined_relative,
+        energy_absolute,
+        energy_relative,
+    )
 end
 
 # -----------------------------------------------------------------------------

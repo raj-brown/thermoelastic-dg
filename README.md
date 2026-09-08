@@ -19,12 +19,23 @@ calculation. A successful run prints:
 Environment check passed: dependencies installed and DG loaded.
 ```
 
-### Run the solver
+### Run cases
 
-After the environment check succeeds:
+`main.jl` is the repository driver. With no argument it runs every registered
+case in order:
 
 ```sh
 julia --project=. main.jl
 ```
 
-The solver writes VTK snapshots, animations, and a final plot under `output/`.
+Run one case or list the available cases:
+
+```sh
+julia --project=. main.jl case_1
+julia --project=. main.jl case_2
+julia --project=. main.jl --list
+```
+
+The individual case implementations are `case_1_carcione.jl` and
+`case_2_carcione.jl`. Generated results are written to `output_figure6/` and
+`output_figure7/`; both directories are ignored by git.

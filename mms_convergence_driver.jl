@@ -1,25 +1,4 @@
 # Standalone manufactured-solution convergence driver.
-#
-# Place this file beside main.jl in the repository root:
-#
-#   repo/
-#     main.jl
-#     mms_convergence_driver.jl   <-- this file
-#     src/DG.jl
-#
-# Run with:
-#
-#   julia --project=. mms_convergence_driver.jl
-#
-# This script does not include, modify, or call main.jl. It loads src/DG.jl
-# directly and writes all results under mms_output/.
-#
-# Required DG.jl API (the proposed eight-field scheme):
-#   NSTATE == 8
-#   state [s_xx,s_zz,s_xz,v_x,v_z,theta,q_x,q_z]
-#   make_material, RHSCacheTE, rhs_thermoelastic_br1!, estimate_dt
-#   CarcioneHeatSource (used only to construct an identically zero source)
-
 module MMSConvergenceDriver
 
 ENV["GKSwstype"] = "100"

@@ -2,6 +2,8 @@
 *.vtu
 *.vtk
 output/
+output_figure6/
+output_figure7/
 mms_output/
 
 # Julia
